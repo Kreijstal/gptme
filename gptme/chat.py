@@ -5,8 +5,17 @@ try:
     import termios
 except ImportError:
     termios = None  # type: ignore
-    if os.name == 'nt':
-        import msvcrt
+
+winpty = None
+msvcrt = None
+if os.name == 'nt':
+    try:
+        import winpty
+    except ImportError:
+        try:
+            import msvcrt
+        except ImportError:
+            pass
 from collections.abc import Generator
 from pathlib import Path
 from typing import cast
@@ -303,7 +312,13 @@ def prompt_user(value=None) -> str:  # pragma: no cover
     # Flush stdin to clear any buffered input before prompting
     if termios:
         termios.tcflush(sys.stdin, termios.TCIFLUSH)
-    elif os.name == 'nt':
+    elif winpty:
+        if hasattr(winpty, 'flush'):
+            winpty.flush()
+        elif msvcrt:
+            while msvcrt.kbhit():
+                msvcrt.getch()
+    elif msvcrt:
         while msvcrt.kbhit():
             msvcrt.getch()
     response = ""

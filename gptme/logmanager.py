@@ -140,7 +140,11 @@ class LogManager:
         """Release the lock and close the file descriptor"""
         if self._lock_fd:
             try:
-                fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
+                if os.name == 'nt' and msvcrt:
+                    # On Windows, lock is automatically released on file close
+                    pass
+                elif fcntl:
+                    fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
                 self._lock_fd.close()
                 # logger.debug(f"Released lock on {self.logdir}")
             except Exception as e:
