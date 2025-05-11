@@ -1,7 +1,10 @@
+import os
 try:
     import fcntl
 except ImportError:
     fcntl = None  # type: ignore
+    if os.name == 'nt':
+        import msvcrt
 import json
 import logging
 import os
@@ -106,7 +109,10 @@ class LogManager:
 
             # Try to acquire an exclusive lock
             try:
-                fcntl.flock(self._lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                if fcntl:
+                    fcntl.flock(self._lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                elif os.name == 'nt':
+                    msvcrt.locking(self._lock_fd.fileno(), msvcrt.LK_NBLCK, 1)
                 # logger.debug(f"Acquired lock on {self.logdir}")
             except BlockingIOError:
                 self._lock_fd.close()
