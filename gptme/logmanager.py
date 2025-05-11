@@ -1,4 +1,7 @@
-import fcntl
+try:
+    import fcntl
+except ImportError:
+    fcntl = None  # type: ignore
 import json
 import logging
 import os

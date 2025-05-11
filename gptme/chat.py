@@ -1,7 +1,10 @@
 import logging
 import os
 import sys
-import termios
+try:
+    import termios
+except ImportError:
+    termios = None  # type: ignore
 from collections.abc import Generator
 from pathlib import Path
 from typing import cast

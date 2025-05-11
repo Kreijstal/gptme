@@ -4,7 +4,10 @@ Utilities for asking user confirmation and handling editable/copiable content.
 
 import re
 import sys
-import termios
+try:
+    import termios
+except ImportError:
+    termios = None  # type: ignore
 from collections.abc import Callable, Generator
 from pathlib import Path
 from textwrap import wrap
