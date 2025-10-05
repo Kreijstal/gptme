@@ -1,7 +1,7 @@
 """
 RAG (Retrieval-Augmented Generation) tool for context-aware assistance.
 
-The RAG tool provides context-aware assistance by indexing and searching project documentation.
+The RAG tool provides context-aware assistance by indexing and semantically searching text files.
 
 .. rubric:: Installation
 
@@ -52,7 +52,7 @@ from .base import ToolSpec, ToolUse
 logger = logging.getLogger(__name__)
 
 instructions = """
-Use RAG to index and search project documentation.
+Use RAG to index and semantically search through text files such as documentation and code.
 """
 
 
@@ -144,7 +144,7 @@ def rag_search(query: str, return_full: bool = False) -> str:
     cmd = ["gptme-rag", "search", query]
     if return_full:
         # shows full context of the search results
-        cmd.extend(["--format", "full", "--score"])
+        cmd.extend(["--raw"])
 
     result = _run_rag_cmd(cmd)
     return result.stdout.strip()
@@ -272,7 +272,7 @@ tool = ToolSpec(
     instructions=instructions,
     examples=examples,
     functions=[rag_index, rag_search, rag_status],
-    available=_has_gptme_rag(),
+    available=_has_gptme_rag,
     init=init,
 )
 

@@ -7,22 +7,37 @@ When prompting, it is important to provide clear instructions and avoid any ambi
 
 import logging
 import platform
-import shutil
 import subprocess
 import time
-from collections.abc import Generator, Iterable
+from collections.abc import Generator
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
 from .__version__ import __version__
-from .config import get_config, get_project_config
+from .config import config_path, get_config, get_project_config
 from .dirs import get_project_git_dir
 from .llm.models import get_model, get_recommended_model
 from .message import Message
 from .tools import ToolFormat, ToolSpec, get_available_tools
 from .util import document_prompt_function
+from .util.content import extract_content_summary
 from .util.context import md_codeblock
+from .util.tree import get_tree_output
+
+# Default files to include in context when no gptme.toml is present or files list is empty
+DEFAULT_CONTEXT_FILES = [
+    "README*",
+    "AGENTS.md",
+    "CLAUDE.md",
+    "GEMINI.md",
+    ".cursor/rules/*.mdc",
+    "pyproject.toml",
+    "package.json",
+    "Cargo.toml",
+    "Makefile",
+    "docker-compose.y*ml",
+]
 
 PromptType = Literal["full", "short"]
 
@@ -35,27 +50,73 @@ def get_prompt(
     prompt: PromptType | str = "full",
     interactive: bool = True,
     model: str | None = None,
-) -> Message:
+    workspace: Path | None = None,
+    agent_path: Path | None = None,
+) -> list[Message]:
     """
     Get the initial system prompt.
-    """
-    msgs: Iterable
-    if prompt == "full":
-        msgs = prompt_full(interactive, tools, tool_format, model)
-    elif prompt == "short":
-        msgs = prompt_short(interactive, tools, tool_format)
-    else:
-        msgs = [Message("system", prompt)]
 
-    # combine all the system prompt messages into one,
-    # also hide them and pin them to the top
-    return _join_messages(list(msgs)).replace(hide=True, pinned=True)
+    Returns a list of messages: [core_system_prompt, workspace_prompt] (if workspace provided).
+    """
+    agent_config = get_project_config(agent_path)
+    agent_name = (
+        agent_config.agent.name if agent_config and agent_config.agent else None
+    )
+
+    # Generate core system messages (without workspace context)
+    core_msgs: list[Message]
+    if prompt == "full":
+        core_msgs = list(
+            prompt_full(interactive, tools, tool_format, model, agent_name=agent_name)
+        )
+    elif prompt == "short":
+        core_msgs = list(
+            prompt_short(interactive, tools, tool_format, agent_name=agent_name)
+        )
+    else:
+        core_msgs = [Message("system", prompt)]
+        if tools:
+            core_msgs.extend(prompt_tools(tools=tools, tool_format=tool_format))
+
+    # Generate workspace messages separately
+    workspace_msgs = (
+        list(prompt_workspace(workspace)) if workspace != agent_path else []
+    )
+
+    # Generate workspace context from agent if provided
+    agent_msgs = list(
+        prompt_workspace(agent_path, title="Agent Workspace", include_path=True)
+    )
+
+    # Combine core messages into one system prompt
+    result = []
+    if core_msgs:
+        core_prompt = _join_messages(core_msgs)
+        result.append(core_prompt)
+
+    # Add agent messages seperately
+    result.extend(agent_msgs)
+
+    # Add workspace messages separately
+    result.extend(workspace_msgs)
+
+    # Generate cross-conversation context if enabled
+    # Add chat history context
+    result.extend(prompt_chat_history())
+
+    # Set hide=True, pinned=True for all messages
+    for i, msg in enumerate(result):
+        result[i] = msg.replace(hide=True, pinned=True)
+
+    return result
 
 
 def _join_messages(msgs: list[Message]) -> Message:
     """Combine several system prompt messages into one."""
+    role = msgs[0].role if msgs else "system"
+    assert all([m.role == role for m in msgs]), "All messages must be of same role"
     return Message(
-        "system",
+        role,
         "\n\n".join(m.content for m in msgs),
         hide=any(m.hide for m in msgs),
         pinned=any(m.pinned for m in msgs),
@@ -63,10 +124,14 @@ def _join_messages(msgs: list[Message]) -> Message:
 
 
 def prompt_full(
-    interactive: bool, tools: list[ToolSpec], tool_format: ToolFormat, model: str | None
+    interactive: bool,
+    tools: list[ToolSpec],
+    tool_format: ToolFormat,
+    model: str | None,
+    agent_name: str | None = None,
 ) -> Generator[Message, None, None]:
     """Full prompt to start the conversation."""
-    yield from prompt_gptme(interactive, model)
+    yield from prompt_gptme(interactive, model, agent_name)
     yield from prompt_tools(tools=tools, tool_format=tool_format)
     if interactive:
         yield from prompt_user()
@@ -76,10 +141,13 @@ def prompt_full(
 
 
 def prompt_short(
-    interactive: bool, tools: list[ToolSpec], tool_format: ToolFormat
+    interactive: bool,
+    tools: list[ToolSpec],
+    tool_format: ToolFormat,
+    agent_name: str | None = None,
 ) -> Generator[Message, None, None]:
     """Short prompt to start the conversation."""
-    yield from prompt_gptme(interactive)
+    yield from prompt_gptme(interactive, agent_name)
     yield from prompt_tools(examples=False, tools=tools, tool_format=tool_format)
     if interactive:
         yield from prompt_user()
@@ -87,7 +155,7 @@ def prompt_short(
 
 
 def prompt_gptme(
-    interactive: bool, model: str | None = None
+    interactive: bool, model: str | None = None, agent_name: str | None = None
 ) -> Generator[Message, None, None]:
     """
     Base system prompt for gptme.
@@ -104,8 +172,14 @@ def prompt_gptme(
     # use <thinking> tags as a fallback if the model doesn't natively support reasoning
     use_thinking_tags = not model_meta or not model_meta.supports_reasoning
 
+    if agent_name:
+        agent_blurb = f"{agent_name}, an agent running in gptme, letting you act as a general-purpose AI assistant powered by LLMs"
+    else:
+        agent_name = f"gptme v{__version__}"
+        agent_blurb = f"{agent_name}, a general-purpose AI assistant powered by LLMs"
+
     default_base_prompt = f"""
-You are gptme v{__version__}, a general-purpose AI assistant powered by LLMs. {('Currently using model: ' + model_meta.full) if model_meta else ''}
+You are {agent_blurb}. {('Currently using model: ' + model_meta.full) if model_meta else ''}
 You are designed to help users with programming tasks, such as writing code, debugging, and learning new concepts.
 You can run code, execute terminal commands, and access the filesystem on the local machine.
 You will help the user with writing code, either from scratch or in existing projects.
@@ -252,7 +326,14 @@ def prompt_systeminfo() -> Generator[Message, None, None]:
         os_info = "unknown"
         os_version = ""
 
-    prompt = f"## System Information\n\n**OS:** {os_info} {os_version}".strip()
+    # Get current working directory
+
+    pwd = Path.cwd()
+
+    prompt = f"""## System Information
+
+**OS:** {os_info} {os_version}
+**Working Directory:** {pwd}""".strip()
 
     yield Message(
         "system",
@@ -269,101 +350,115 @@ def prompt_timeinfo() -> Generator[Message, None, None]:
     yield Message("system", prompt)
 
 
-def get_tree_output(workspace: Path) -> str | None:
-    """Get the output of `tree --gitignore .` if available."""
-    if get_config().get_env("GPTME_CONTEXT_TREE") not in ["1", "true"]:
-        return None
-
-    # Check if tree command is available
-    if shutil.which("tree") is None:
-        logger.warning(
-            "GPTME_CONTEXT_TREE is enabled, but 'tree' command is not available. Install it to use this feature."
-        )
-        return None
-
-    # Check if in a git repository
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "--is-inside-work-tree"],
-            cwd=workspace,
-            capture_output=True,
-            text=True,
-            timeout=1,
-        )
-        if result.returncode != 0:
-            logger.debug("Not in a git repository, skipping tree output")
-            return None
-    except Exception as e:
-        logger.warning(f"Error checking git repository: {e}")
-        return None
-
-    # TODO: use `git ls-files` instead? (respects .gitignore better)
-    try:
-        # Run tree command with --gitignore option
-        result = subprocess.run(
-            ["tree", "--gitignore", "."],
-            cwd=workspace,
-            capture_output=True,
-            text=True,
-            timeout=5,  # Add timeout to prevent hangs
-        )
-        if result.returncode != 0:
-            logger.warning(f"Failed to run tree command: {result.stderr}")
-            return None
-        # we allocate roughly a ~5000 token budget (~20000 characters)
-        if len(result.stdout) > 20000:
-            logger.warning("Tree output listing files is too long, skipping.")
-            return None
-
-        return result.stdout.strip()
-    except Exception as e:
-        logger.warning(f"Error running tree command: {e}")
-        return None
-
-
-def get_workspace_prompt(workspace: Path) -> str:
-    # NOTE: needs to run after the workspace is initialized (i.e. initial prompt is constructed)
+def prompt_workspace(
+    workspace: Path | None = None,
+    title="Project Workspace",
+    include_path: bool = False,
+) -> Generator[Message, None, None]:
     # TODO: update this prompt if the files change
     # TODO: include `git status -vv`, and keep it up-to-date
     sections = []
 
-    if project := get_project_config(workspace):
-        # files
-        files: list[Path] = []
-        for fileglob in project.files:
-            # expand user
-            fileglob = str(Path(fileglob).expanduser())
-            # expand with glob
-            if new_files := workspace.glob(fileglob):
-                files.extend(new_files)
-            else:
+    if workspace is None:
+        return
+
+    # Add workspace path if requested
+    if include_path:
+        sections.append(f"**Path:** {workspace.resolve()}")
+
+    project = get_project_config(workspace)
+
+    # Determine which file patterns to use
+    if project is None or project.files is None:
+        # No project config or no files specified in config
+        file_patterns = DEFAULT_CONTEXT_FILES
+        if project is None:
+            logger.debug("No project config found, using default context files")
+        else:
+            logger.debug(
+                "Project config has no files specified, using default context files"
+            )
+    else:
+        # Project config exists with files explicitly set (could be empty list)
+        file_patterns = project.files
+        if not project.files:
+            logger.debug(
+                "Project config has files explicitly set to empty, not including any files"
+            )
+
+    # Process file patterns
+    files: list[Path] = []
+    for fileglob in file_patterns:
+        # expand user
+        fileglob = str(Path(fileglob).expanduser())
+        # expand with glob
+        if new_files := workspace.glob(fileglob):
+            files.extend(new_files)
+        else:
+            # Only warn for explicitly configured files, not defaults
+            if project and project.files is not None:
                 logger.warning(
                     f"File glob '{fileglob}' specified in project config does not match any files."
                 )
-        files_str = []
-        for file in files:
-            if file.exists():
-                files_str.append(md_codeblock(file, file.read_text(encoding='utf-8')))
-        if files_str:
-            sections.append(
-                "## Selected project files\n\nRead more with `cat`.\n\n"
-                + "\n\n".join(files_str)
-            )
 
-        # context_cmd
-        if project.context_cmd and (
-            cmd_output := get_project_context_cmd_output(project.context_cmd, workspace)
-        ):
-            sections.append("## Computed context\n\n" + cmd_output)
+    # Also include user-level files from ~/.config/gptme/config.toml
+    # Resolution rules:
+    # - Absolute paths: used as-is
+    # - ~ expansion supported
+    # - Relative paths: resolved relative to the config directory (e.g. ~/.config/gptme)
+    try:
+        user_files = (
+            get_config().user.prompt.files
+            if get_config().user and get_config().user.prompt
+            else []
+        )
+    except Exception:
+        user_files = []
+    if user_files:
+        config_dir = Path(config_path).expanduser().resolve().parent
+        existing = {str(Path(p).resolve()) for p in files if Path(p).exists()}
+        for entry in user_files:
+            p = Path(entry).expanduser()
+            if not p.is_absolute():
+                p = config_dir / entry
+            try:
+                p = p.resolve()
+            except Exception:
+                # If resolve fails (e.g., path doesn’t exist yet), keep as-is
+                pass
+            if p.exists():
+                rp = str(p)
+                if rp not in existing:
+                    files.append(p)
+                    existing.add(rp)
+            else:
+                logger.debug(f"User-configured file not found: {p}")
 
     # Get tree output if enabled
     if tree_output := get_tree_output(workspace):
         sections.append(f"## Project Structure\n\n{md_codeblock('', tree_output)}\n\n")
 
+    files_str = []
+    for file in files:
+        if file.exists():
+            files_str.append(md_codeblock(file.resolve(), file.read_text()))
+    if files_str:
+        sections.append(
+            "## Selected files\n\nRead more with `cat`.\n\n" + "\n\n".join(files_str)
+        )
+
+    # context_cmd
+    if (
+        project
+        and project.context_cmd
+        and (
+            cmd_output := get_project_context_cmd_output(project.context_cmd, workspace)
+        )
+    ):
+        sections.append("## Computed context\n\n" + cmd_output)
+
     if sections:
-        return "# Workspace Context\n\n" + "\n\n".join(sections)
-    else:
-        return ""
+        yield Message("system", f"# {title}\n\n" + "\n\n".join(sections))
 
 
 def get_project_context_cmd_output(cmd: str, workspace: Path) -> str | None:
@@ -377,7 +472,7 @@ def get_project_context_cmd_output(cmd: str, workspace: Path) -> str | None:
             text=True,
             timeout=10,
         )
-        logger.info(f"Context command took {time.time() - start:.2f}s")
+        logger.debug(f"Context command took {time.time() - start:.2f}s")
         if result.returncode == 0:
             return md_codeblock(cmd, result.stdout)
         else:
@@ -385,6 +480,136 @@ def get_project_context_cmd_output(cmd: str, workspace: Path) -> str | None:
     except Exception as e:
         logger.warning(f"Error running context command: {e}")
     return None
+
+
+def use_chat_history_context() -> bool:
+    """Check if cross-conversation context is enabled."""
+    config = get_config()
+    flag: str = config.get_env("GPTME_CHAT_HISTORY", "")  # type: ignore
+    return flag.lower() in ("1", "true", "yes")
+
+
+def prompt_chat_history() -> Generator[Message, None, None]:
+    """
+    Generate cross-conversation context from recent conversations.
+
+    Provides continuity by including key information from recent conversations,
+    helping the assistant understand context across conversation boundaries.
+    """
+    if not use_chat_history_context():
+        return
+
+    try:
+        from .logmanager import LogManager, list_conversations  # fmt: skip
+
+        # Get recent conversations (we'll filter further)
+        recent_conversations = list_conversations(limit=20, include_test=False)
+
+        if not recent_conversations:
+            return
+
+        # Filter out very short conversations (likely tests or brief interactions)
+        substantial_conversations = [
+            conv
+            for conv in recent_conversations
+            if conv.messages >= 4  # At least 2 exchanges
+        ]
+
+        if not substantial_conversations:
+            return
+
+        # Take the 3 most recent substantial conversations
+        conversations_to_summarize = substantial_conversations[:5]
+
+        context_parts = []
+
+        for _, conv in enumerate(conversations_to_summarize, 1):
+            try:
+                # Load the conversation
+                log_manager = LogManager.load(Path(conv.path).parent, lock=False)
+                messages = log_manager.log.messages
+
+                # Extract key messages: first few user messages and last assistant message
+                user_messages = [msg for msg in messages if msg.role == "user"]
+                assistant_messages = [
+                    msg for msg in messages if msg.role == "assistant"
+                ]
+
+                if not user_messages:
+                    continue
+
+                # Get first 2 user messages (captures the main task/context)
+                first_user_msgs = user_messages[:2]
+
+                # Find the best assistant message to use as "last response"
+                best_assistant_msg = None
+                for msg in reversed(assistant_messages):
+                    content = extract_content_summary(msg.content)
+                    if content and len(content.split()) >= 10:  # At least 10 words
+                        best_assistant_msg = msg
+                        break
+
+                # Create a concise summary
+                summary_parts = []
+
+                # Add conversation metadata
+                summary_parts.append(f"## {conv.name}")
+                summary_parts.append(
+                    f"Modified: {datetime.fromtimestamp(conv.modified).strftime('%Y-%m-%d %H:%M')}"
+                )
+
+                # Add key user requests (first ~100 words each)
+                for msg in user_messages[:1]:
+                    content = extract_content_summary(msg.content)
+                    if content:
+                        summary_parts.append(f"User: {content}")
+
+                # Second user message if available
+                for msg in user_messages[1:2]:
+                    content = extract_content_summary(msg.content)
+                    if content:
+                        # Add placeholder assistant response
+                        summary_parts.append("Assistant: (response omitted)")
+                        summary_parts.append(f"User: {content}")
+
+                # Add placeholder message containing number of omitted messages
+                omitted_count = (
+                    len(messages)
+                    - len(first_user_msgs)
+                    - (1 if best_assistant_msg else 0)
+                )
+                if omitted_count > 0:
+                    summary_parts.append(f"... ({omitted_count} messages omitted) ...")
+
+                # Add best assistant response if available
+                if best_assistant_msg:
+                    outcome = extract_content_summary(best_assistant_msg.content)
+                    if outcome:
+                        summary_parts.append(f"Assistant: {outcome}")
+
+                if len(summary_parts) > 2:  # More than just metadata
+                    context_parts.append("\n".join(summary_parts))
+
+            except Exception as e:
+                logger.debug(f"Failed to process conversation {conv.name}: {e}")
+                continue
+
+        sep = "\n---\n"
+        if context_parts:
+            context_content = f"""# Recent Conversation Context
+
+The following is a summary of your recent conversations with the user to provide continuity:
+
+```history
+{sep.join(part for part in context_parts)}
+```
+
+Use this context to understand ongoing projects, preferences, and previous discussions.
+"""
+            yield Message("system", context_content)
+
+    except Exception as e:
+        logger.debug(f"Failed to generate chat history context: {e}")
 
 
 document_prompt_function(
@@ -399,3 +624,4 @@ document_prompt_function(tools=get_available_tools(), tool_format="markdown")(
 # document_prompt_function(tool_format="xml")(prompt_tools)
 # document_prompt_function(tool_format="tool")(prompt_tools)
 document_prompt_function()(prompt_systeminfo)
+document_prompt_function()(prompt_chat_history)

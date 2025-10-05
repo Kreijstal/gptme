@@ -4,6 +4,7 @@
 # https://www.sphinx-doc.org/en/master/usage/configuration.html
 # -- Project information -----------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#project-information
+
 import re
 from datetime import date
 
@@ -86,13 +87,21 @@ extensions = [
     "myst_parser",
     "sphinx.ext.napoleon",
     "sphinx.ext.autodoc",
+    "sphinx.ext.intersphinx",
     "sphinx.ext.extlinks",
     "sphinx.ext.autosectionlabel",
+    "sphinxcontrib.mermaid",
     "sphinx_click",
     "sphinxcontrib.programoutput",
     "sphinxcontrib.asciinema",
     "sphinx_sitemap",
+    "sphinx_llms_txt",
 ]
+
+# Intersphinx mapping for cross-references to Python standard library
+intersphinx_mapping = {
+    "python": ("https://docs.python.org/3", None),
+}
 
 html_baseurl = "https://gptme.org/docs/"  # used to build sitemap
 sitemap_url_scheme = "{link}"
@@ -113,6 +122,9 @@ extlinks = {
 # Useful for avoiding ambiguity when the same section heading appears in different documents.
 autosectionlabel_prefix_document = True
 
+# Only autolabel sections up to a certain depth to avoid conflicts with generated CLI docs
+autosectionlabel_maxdepth = 2
+
 autodoc_typehints_format = "short"
 autodoc_class_signature = "separated"
 napoleon_attr_annotations = False
@@ -128,6 +140,7 @@ nitpick_ignore = [
     ("py:class", "threading.Thread"),
     ("py:class", "gptme.tools.computer.ScalingSource"),
     ("py:class", "gptme.config.RagConfig"),
+    ("py:class", "ToolFormat"),
 ]
 
 # -- Options for HTML output -------------------------------------------------

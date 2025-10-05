@@ -92,7 +92,7 @@ class Patch:
             # if original chunk not in file, we want to include the current file contents in the error message so it can recover fast
             file_contents = (
                 f"Here are the actual file contents:\n```original\n{content}\n```"
-                if get_config().get_env("GPTME_PATCH_RECOVERY") in ["true", "1"]
+                if get_config().get_env_bool("GPTME_PATCH_RECOVERY")
                 else ""
             )
             raise ValueError(f"original chunk not found in file\n{file_contents}")
@@ -165,6 +165,14 @@ class Patch:
                 if UPDATED not in after_divider:  # pragma: no cover
                     raise ValueError("invalid patch format: missing >>>>>>> UPDATED")
                 modified, _ = re.split(re.escape(UPDATED), after_divider, maxsplit=1)
+
+                # Check for extra ======= markers in the updated content
+                if "\n=======" in modified:
+                    raise ValueError(
+                        "invalid patch format: extra ======= marker found in updated content. "
+                        "Use only one ======= between original and updated content."
+                    )
+
             yield Patch(original, modified)
 
     @classmethod
@@ -235,12 +243,12 @@ def execute_patch_impl(
         warnings_str = "\n".join(warnings)
         yield Message(
             "system",
-            f"Patch successfully applied to {path}\n{warnings_str}".strip(),
+            f"Patch successfully applied to `{path}`\n{warnings_str}".strip(),
         )
 
     except FileNotFoundError:
         raise ValueError(
-            f"Patch failed: No such file or directory '{path}' (pwd: {Path.cwd()})"
+            f"Patch failed: No such file or directory `{path}` (pwd: `{Path.cwd()}`)"
         ) from None
     except ValueError as e:
         raise ValueError(f"Patch failed: {e.args[0]}") from None

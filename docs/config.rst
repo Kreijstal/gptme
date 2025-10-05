@@ -79,7 +79,7 @@ Example ``gptme.toml``:
 
 This file currently supports a few options:
 
-- ``files``, a list of paths that gptme will always include in the context.
+- ``files``, a list of paths that gptme will always include in the context. If no ``gptme.toml`` is present or if the ``files`` option is unset, gptme will automatically look for common project files, such as: ``README.md``, ``pyproject.toml``, ``package.json``, ``Cargo.toml``, ``Makefile``, ``.cursor/rules/**.mdc``, ``CLAUDE.md``, ``GEMINI.md``.
 - ``prompt``, a string that will be included in the system prompt with a ``# Current Project`` header.
 - ``base_prompt``, a string that will be used as the base prompt for the project. This will override the global base prompt ("You are gptme v{__version__}, a general-purpose AI assistant powered by LLMs. [...]"). It can be useful to change the identity of the assistant and override some default behaviors.
 - ``context_cmd``, a command used to generate context to include when constructing the system prompt. The command will be run in the workspace root and should output a string that will be included in the system prompt. Examples can be ``git status -v`` or ``scripts/context.sh``.
@@ -110,6 +110,7 @@ Besides the configuration files, gptme supports several environment variables to
 .. rubric:: Feature Flags
 
 - ``GPTME_CHECK`` - Enable ``pre-commit`` checks (default: true if ``.pre-commit-config.yaml`` present, see :ref:`pre-commit`)
+- ``GPTME_CHAT_HISTORY`` - Enable cross-conversation context (default: false)
 - ``GPTME_COSTS`` - Enable cost reporting for API calls (default: false)
 - ``GPTME_FRESH`` - Enable fresh context mode (default: false)
 - ``GPTME_BREAK_ON_TOOLUSE`` - Interrupt generation when tool use occurs in stream (default: true)
@@ -126,3 +127,24 @@ Besides the configuration files, gptme supports several environment variables to
 - ``GPTME_LOGS_HOME`` - Override the default logs folder location
 
 All boolean flags accept "1", "true" (case-insensitive) as truthy values.
+
+Cross-Conversation Context
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+When ``GPTME_CHAT_HISTORY=true`` is set, gptme will automatically include summaries from recent conversations in new chat sessions, providing continuity across conversations.
+
+**What it includes:**
+
+- Summaries of the 3 most recent substantial conversations (4+ messages)
+- Initial user requests and follow-ups from each conversation
+- Last meaningful assistant response from each conversation
+- Filters out test conversations and very short interactions
+
+**Benefits:**
+
+- Better continuity for ongoing projects and work
+- Understanding of user preferences and communication style
+- Context for follow-up questions without manual references
+- Awareness of previous technical discussions and solutions
+
+The context is automatically included as a system message when starting new conversations, enabling much better continuity without needing to manually reference previous conversations or maintain persistent notes.

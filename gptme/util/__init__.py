@@ -6,7 +6,6 @@ import functools
 import logging
 import re
 import shutil
-import sys
 import textwrap
 from datetime import datetime, timedelta
 from functools import lru_cache
@@ -146,12 +145,6 @@ def transform_examples_to_chat_directives(s: str, strict=False) -> str:
     return s
 
 
-def print_bell():
-    """Ring the terminal bell."""
-    sys.stdout.write("\a")
-    sys.stdout.flush()
-
-
 @lru_cache
 def _is_sphinx_build() -> bool:
     """Check if the code is being executed in a Sphinx build."""
@@ -200,12 +193,12 @@ def document_prompt_function(*args, **kwargs):
     return decorator
 
 
-def path_with_tilde(path: Path) -> str:
+def path_with_tilde(path: Path) -> Path:
     home = str(Path.home())
     path_str = str(path)
     if path_str.startswith(home):
-        return path_str.replace(home, "~", 1)
-    return path_str
+        return Path(path_str.replace(home, "~", 1))
+    return path
 
 
 @functools.lru_cache

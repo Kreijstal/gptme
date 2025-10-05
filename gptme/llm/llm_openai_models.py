@@ -5,6 +5,34 @@ if TYPE_CHECKING:
     from .models import _ModelDictMeta  # fmt: skip
 
 OPENAI_MODELS: dict[str, "_ModelDictMeta"] = {
+    # GPT-5
+    "gpt-5": {
+        "context": 400_000,
+        "max_output": 128_000,
+        "price_input": 1.25,  # $0.13 for cached inputs
+        "price_output": 10,
+        "supports_vision": True,
+        "supports_reasoning": True,
+        "knowledge_cutoff": datetime(2024, 9, 30),
+    },
+    "gpt-5-mini": {
+        "context": 400_000,
+        "max_output": 128_000,
+        "price_input": 0.25,  # $0.025 for cached inputs
+        "price_output": 2,
+        "supports_vision": True,
+        "supports_reasoning": True,
+        "knowledge_cutoff": datetime(2024, 5, 31),
+    },
+    "gpt-5-nano": {
+        "context": 400_000,
+        "max_output": 128_000,
+        "price_input": 0.05,  # $0.005 for cached inputs
+        "price_output": 0.4,
+        "supports_vision": True,
+        "supports_reasoning": True,
+        "knowledge_cutoff": datetime(2024, 5, 31),
+    },
     # GPT-4o
     "gpt-4o": {
         "context": 128_000,
@@ -45,22 +73,26 @@ OPENAI_MODELS: dict[str, "_ModelDictMeta"] = {
         "context": 128_000,
         "price_input": 15,
         "price_output": 60,
+        "supports_reasoning": True,
     },
     "o1-preview-2024-09-12": {
         "context": 128_000,
         "price_input": 15,
         "price_output": 60,
+        "supports_reasoning": True,
     },
     # OpenAI o1-mini
     "o1-mini": {
         "context": 128_000,
         "price_input": 3,
         "price_output": 12,
+        "supports_reasoning": True,
     },
     "o1-mini-2024-09-12": {
         "context": 128_000,
         "price_input": 3,
         "price_output": 12,
+        "supports_reasoning": True,
     },
     # GPT-4 Turbo
     "gpt-4-turbo": {

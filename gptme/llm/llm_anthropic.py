@@ -1,21 +1,30 @@
-import base64
 import logging
+import os
 import time
 from collections.abc import Generator, Iterable
 from functools import wraps
-from pathlib import Path
 from typing import (
     TYPE_CHECKING,
     Any,
     Literal,
     TypedDict,
+    Union,
     cast,
 )
 
 from ..constants import TEMPERATURE, TOP_P
 from ..message import Message, msgs2dicts
-from ..tools.base import Parameter, ToolSpec, ToolUse
+from ..telemetry import record_llm_request
+from ..tools.base import ToolSpec
 from .models import ModelMeta, get_model
+from .utils import (
+    extract_tool_uses_from_assistant_message,
+    parameters2dict,
+    process_image_file,
+)
+
+ENV_REASONING = "GPTME_REASONING"
+ENV_REASONING_BUDGET = "GPTME_REASONING_BUDGET"
 
 if TYPE_CHECKING:
     # noreorder
@@ -25,9 +34,51 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _anthropic: "Anthropic | None" = None
+_is_proxy: bool = False
+
+
+def _record_usage(
+    usage: Union["anthropic.types.Usage", "anthropic.types.MessageDeltaUsage"],
+    model: str,
+) -> None:
+    """Record usage metrics as telemetry."""
+    if not usage:
+        return None
+
+    # Extract token counts
+    input_tokens = getattr(usage, "input_tokens", None)
+    output_tokens = getattr(usage, "output_tokens", None)
+    cache_creation_tokens = getattr(usage, "cache_creation_input_tokens", None)
+    cache_read_tokens = getattr(usage, "cache_read_input_tokens", None)
+
+    # Calculate total tokens
+    total_tokens = 0
+    total_tokens += input_tokens or 0
+    total_tokens += output_tokens or 0
+    total_tokens += cache_creation_tokens or 0
+    total_tokens += cache_read_tokens or 0
+
+    # Record the LLM request with token usage
+    record_llm_request(
+        provider="anthropic",
+        model=model,
+        success=True,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cache_creation_tokens=cache_creation_tokens,
+        cache_read_tokens=cache_read_tokens,
+        total_tokens=total_tokens if total_tokens > 0 else None,
+    )
 
 
 def _should_use_thinking(model_meta: ModelMeta, tools: list[ToolSpec] | None) -> bool:
+    # Support environment variable to override reasoning behavior
+    env_reasoning = os.environ.get(ENV_REASONING)
+    if env_reasoning and env_reasoning.lower() in ("1", "true", "yes"):
+        return True
+    elif env_reasoning and env_reasoning.lower() in ("0", "false", "no"):
+        return False
+
     # Only enable thinking for supported models and when not using `tool` format
     if not model_meta.supports_reasoning:
         return False
@@ -91,7 +142,8 @@ def retry_generator_on_overloaded(max_retries: int = 5, base_delay: float = 1.0)
 
 
 def init(config):
-    global _anthropic
+    global _anthropic, _is_proxy
+    proxy_url = config.get_env("LLM_PROXY_URL", None)
     proxy_key = config.get_env("LLM_PROXY_API_KEY")
     api_key = proxy_key or config.get_env_required("ANTHROPIC_API_KEY")
     from anthropic import Anthropic  # fmt: skip
@@ -99,8 +151,9 @@ def init(config):
     _anthropic = Anthropic(
         api_key=api_key,
         max_retries=5,
-        base_url=config.get_env("LLM_PROXY_URL", None),
+        base_url=proxy_url or None,
     )
+    _is_proxy = proxy_url is not None
 
 
 def get_client() -> "Anthropic | None":
@@ -119,16 +172,15 @@ def chat(messages: list[Message], model: str, tools: list[ToolSpec] | None) -> s
     messages_dicts, system_messages, tools_dict = _prepare_messages_for_api(
         messages, tools
     )
+    api_model = f"anthropic/{model}" if _is_proxy else model
 
     model_meta = get_model(f"anthropic/{model}")
     use_thinking = _should_use_thinking(model_meta, tools)
-    thinking_budget = 16000
-    max_tokens = (model_meta.max_output or 4096) + (
-        thinking_budget if use_thinking else 0
-    )
+    thinking_budget = int(os.environ.get(ENV_REASONING_BUDGET, "16000"))
+    max_tokens = model_meta.max_output or 4096
 
     response = _anthropic.messages.create(
-        model=model,
+        model=api_model,
         messages=messages_dicts,
         system=system_messages,
         temperature=TEMPERATURE if not use_thinking else 1,
@@ -142,7 +194,7 @@ def chat(messages: list[Message], model: str, tools: list[ToolSpec] | None) -> s
         ),
     )
     content = response.content
-    logger.debug(response.usage)
+    _record_usage(response.usage, model)
 
     parsed_block = []
     for block in content:
@@ -169,16 +221,16 @@ def stream(
     messages_dicts, system_messages, tools_dict = _prepare_messages_for_api(
         messages, tools
     )
+    api_model = f"anthropic/{model}" if _is_proxy else model
 
     model_meta = get_model(f"anthropic/{model}")
     use_thinking = _should_use_thinking(model_meta, tools)
-    thinking_budget = 16000
-    max_tokens = (model_meta.max_output or 4096) + (
-        thinking_budget if use_thinking else 0
-    )
+    # Use the same configurable thinking budget as chat()
+    thinking_budget = int(os.environ.get(ENV_REASONING_BUDGET, "16000"))
+    max_tokens = model_meta.max_output or 4096
 
     with _anthropic.messages.stream(
-        model=model,
+        model=api_model,
         messages=messages_dicts,
         system=system_messages,
         temperature=TEMPERATURE if not use_thinking else 1,
@@ -243,10 +295,11 @@ def stream(
                         anthropic.types.MessageStartEvent,
                         chunk,
                     )
-                    logger.debug(chunk.message.usage)
+                    # Don't record usage here, wait for message_delta with final usage
                 case "message_delta":
                     chunk = cast(anthropic.types.MessageDeltaEvent, chunk)
-                    logger.debug(chunk.usage)
+                    # Record usage from message_delta which contains the final/cumulative usage
+                    _record_usage(chunk.usage, model)
                 case "message_stop":
                     pass
                 case _:
@@ -270,62 +323,24 @@ def _handle_tools(message_dicts: Iterable[dict]) -> Generator[dict, None, None]:
         # Find tool_use occurrences and format them as expected
         elif message["role"] == "assistant":
             modified_message = dict(message)
-            text = ""
-            content = []
 
-            # Some content are text, some are list
-            if isinstance(message["content"], list):
-                message_parts = message["content"]
-            else:
-                message_parts = [{"type": "text", "text": message["content"]}]
+            content_parts, tool_uses = extract_tool_uses_from_assistant_message(
+                message["content"], tool_format_override="tool"
+            )
 
-            for message_part in message_parts:
-                if message_part["type"] != "text":
-                    content.append(message_part)
-                    continue
+            # Add tool uses in Anthropic format
+            for tooluse in tool_uses:
+                content_parts.append(
+                    {
+                        "type": "tool_use",
+                        "id": tooluse.call_id or "",
+                        "name": tooluse.tool,
+                        "input": tooluse.kwargs or {},
+                    }
+                )
 
-                # For a message part of type `text`` we try to extract the tool_uses
-                # We search line by line to stop as soon as we have a tool call
-                # It makes it easier to split in multiple parts.
-                for line in message_part["text"].split("\n"):
-                    text += line + "\n"
-
-                    tooluses = [
-                        tooluse
-                        for tooluse in ToolUse.iter_from_content(text)
-                        if tooluse.is_runnable
-                    ]
-                    if not tooluses:
-                        continue
-
-                    # At that point we should always have exactly one tooluse
-                    # Because we remove the previous ones as soon as we encounter
-                    # them so we can't have more.
-                    assert len(tooluses) == 1
-                    tooluse = tooluses[0]
-                    # We only want to add a tool call if we have a call_id which
-                    # means it is a tool response
-                    if tooluse.call_id:
-                        before_tool = text[: tooluse.start]
-
-                        if before_tool.strip():
-                            content.append({"type": "text", "text": before_tool})
-
-                        content.append(
-                            {
-                                "type": "tool_use",
-                                "id": tooluse.call_id or "",
-                                "name": tooluse.tool,
-                                "input": tooluse.kwargs or {},
-                            }
-                        )
-                    else:
-                        content.append({"type": "text", "text": text})
-                    # The text is emptied to start over with the next lines if any.
-                    text = ""
-
-            if content:
-                modified_message["content"] = content
+            if content_parts:
+                modified_message["content"] = content_parts
 
             yield modified_message
         else:
@@ -347,39 +362,11 @@ def _process_file(message_dict: dict) -> dict:
     )
 
     for f in message_dict.pop("files", []):
-        f = Path(f).expanduser()
-        ext = f.suffix[1:]
-        if ext not in ALLOWED_FILE_EXTS:
-            logger.warning("Unsupported file type: %s", ext)
-            continue
-        if ext == "jpg":
-            ext = "jpeg"
-        media_type = f"image/{ext}"
-
-        content.append(
-            {
-                "type": "text",
-                "text": f"![{f.name}]({f.name}):",
-            }
-        )
-
-        # read file
-        data_bytes = f.read_bytes()
-        data = base64.b64encode(data_bytes).decode("utf-8")
-
-        # check that the file is not too large
-        # anthropic limit is 5MB, seems to measure the base64-encoded size instead of raw bytes
-        # TODO: use compression to reduce file size
-        # print(f"{len(data)=}")
-        if len(data) > 5 * 1_024 * 1_024:
-            content.append(
-                {
-                    "type": "text",
-                    "text": "Image size exceeds 5MB. Please upload a smaller image.",
-                }
-            )
+        result = process_image_file(f, content, max_size_mb=5, expand_user=True)
+        if result is None:
             continue
 
+        data, media_type = result
         content.append(
             {
                 "type": "image",
@@ -466,23 +453,6 @@ def _transform_system_messages(
     return messages, system_messages
 
 
-def _parameters2dict(parameters: list[Parameter]) -> dict[str, object]:
-    required = []
-    properties = {}
-
-    for param in parameters:
-        if param.required:
-            required.append(param.name)
-        properties[param.name] = {"type": param.type, "description": param.description}
-
-    return {
-        "type": "object",
-        "properties": properties,
-        "required": required,
-        "additionalProperties": False,
-    }
-
-
 def _spec2tool(
     spec: ToolSpec,
 ) -> "anthropic.types.ToolParam":
@@ -494,7 +464,7 @@ def _spec2tool(
     return {
         "name": name,
         "description": spec.get_instructions("tool"),
-        "input_schema": _parameters2dict(spec.parameters),
+        "input_schema": parameters2dict(spec.parameters),
     }
 
 
@@ -567,10 +537,27 @@ def _prepare_messages_for_api(
                     item = cast(anthropic.types.TextBlockParam, item)
                     item["text"] = item["text"].rstrip()
 
+        # Filter out empty text blocks to prevent API errors
+        filtered_parts = []
+        for part in content_parts:
+            if part.get("type") == "text":
+                text_content = part.get("text", "")
+                # Skip empty text blocks
+                if isinstance(text_content, str) and text_content.strip():
+                    filtered_parts.append(part)
+            else:
+                # Keep all non-text parts
+                filtered_parts.append(part)
+        content_parts = filtered_parts
+
         messages_dicts_new.append({"role": msg["role"], "content": content_parts})
 
     # set for the first system message (static between sessions)
-    system_messages[0]["cache_control"] = {"type": "ephemeral"}
+    # Only set cache_control if the system message has non-empty content
+    if system_messages:
+        system_text = system_messages[0].get("text")
+        if system_text and isinstance(system_text, str) and system_text.strip():
+            system_messages[0]["cache_control"] = {"type": "ephemeral"}
 
     # set cache points at the two last user messages, as suggested in Anthropic docs:
     # > The conversation history (previous messages) is included in the messages array.
@@ -579,6 +566,14 @@ def _prepare_messages_for_api(
     # https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching#continuing-a-multi-turn-conversation
     for msgp in [msg for msg in messages_dicts_new if msg["role"] == "user"][-2:]:
         assert isinstance(msgp["content"], list)
-        msgp["content"][-1]["cache_control"] = {"type": "ephemeral"}  # type: ignore
+        if msgp["content"]:  # Ensure content list is not empty
+            last_content = msgp["content"][-1]
+            # Only set cache_control if this isn't an empty text block
+            if last_content.get("type") != "text" or (
+                last_content.get("text")
+                and isinstance(last_content.get("text"), str)
+                and last_content.get("text").strip()
+            ):
+                last_content["cache_control"] = {"type": "ephemeral"}
 
     return messages_dicts_new, system_messages, tools_dict

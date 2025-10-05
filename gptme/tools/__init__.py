@@ -6,9 +6,9 @@ from collections.abc import Generator
 
 from gptme.config import get_config
 from gptme.constants import INTERRUPT_CONTENT
-from gptme.tools.mcp_adapter import create_mcp_tools
 
 from ..message import Message
+from ..telemetry import trace_function
 from ..util.interrupt import clear_interruptible
 from ..util.terminal import terminal_state_title
 from .base import (
@@ -136,29 +136,57 @@ def init_tools(
             if tool.init:
                 tool = tool.init()
 
+            # Register tool's hooks and commands
+            tool.register_hooks()
+            tool.register_commands()
+
             loaded_tools.append(tool)
 
         for tool_name in allowlist or []:
             if not has_tool(tool_name):
+                # if the tool is found but unavailable, we log a warning
+                if tool_name in [tool.name for tool in get_available_tools()]:
+                    logger.warning("Tool %s found but is unavailable", tool_name)
+                    continue
                 raise ValueError(f"Tool '{tool_name}' not found")
 
         return loaded_tools
 
 
 def get_toolchain(allowlist: list[str] | None) -> list[ToolSpec]:
+    # Validate allowlist if provided
+    # TODO: maybe check in CLI init instead, as this might hard error in the server when loading conversations where tools are not available
+    if allowlist is not None:
+        available_tools = get_available_tools()
+        available_tool_names = [tool.name for tool in available_tools]
+
+        for tool_name in allowlist:
+            if tool_name not in available_tool_names:
+                raise ValueError(
+                    f"Tool '{tool_name}' not found. Available tools: {', '.join(sorted(available_tool_names))}"
+                )
+
+            # Check if tool is available
+            tool_obj = next(tool for tool in available_tools if tool.name == tool_name)
+            if not tool_obj.is_available:
+                raise ValueError(
+                    f"Tool '{tool_name}' is unavailable (likely missing dependencies)"
+                )
+
     tools = []
     for tool in get_available_tools():
-        if allowlist and not tool.is_mcp and tool.name not in allowlist:
+        if allowlist is not None and not tool.is_mcp and tool.name not in allowlist:
             continue
-        if not tool.available:
+        if not tool.is_available:
             continue
         if tool.disabled_by_default:
-            if not allowlist or tool.name not in allowlist:
+            if allowlist is None or tool.name not in allowlist:
                 continue
         tools.append(tool)
     return tools
 
 
+@trace_function(name="tools.execute_msg", attributes={"component": "tools"})
 def execute_msg(msg: Message, confirm: ConfirmFunc) -> Generator[Message, None, None]:
     """Uses any tools called in a message and returns the response."""
     assert msg.role == "assistant", "Only assistant messages can be executed"
@@ -197,6 +225,8 @@ def is_supported_langtag(lang: str) -> bool:
 
 
 def get_available_tools() -> list[ToolSpec]:
+    from gptme.tools.mcp_adapter import create_mcp_tools  # fmt: skip
+
     available_tools = _get_available_tools_cache()
 
     if available_tools is None:

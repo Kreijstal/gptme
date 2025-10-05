@@ -9,6 +9,7 @@ from flask.testing import FlaskClient
 import tomlkit  # noqa
 from gptme.config import ChatConfig, MCPConfig
 from gptme.llm.models import ModelMeta, get_default_model
+from gptme.prompts import get_prompt
 from gptme.tools import get_toolchain
 
 # Skip if flask not installed
@@ -24,15 +25,9 @@ def create_conversation(client: FlaskClient, config: ChatConfig | None = None):
     """Create a V2 conversation with a session and optional config."""
     convname = f"test-server-v2-{random.randint(0, 1000000)}"
 
-    # Create conversation with a system message
+    # Create conversation with a custom system prompt
     json: dict[str, Any] = {
-        "messages": [
-            {
-                "role": "system",
-                "content": "You are an AI assistant for testing.",
-                "timestamp": datetime.now().isoformat(),
-            }
-        ],
+        "prompt": "You are an AI assistant for testing.",
     }
 
     if config:
@@ -91,9 +86,57 @@ def test_v2_conversation_get(v2_conv, client: FlaskClient):
     assert data is not None
     assert "log" in data
 
-    # Should contain the system message we created
-    assert len(data["log"]) == 1
+    # Should contain system messages (custom system prompt + possibly workspace prompt)
+    assert len(data["log"]) >= 1  # At least custom system prompt
     assert data["log"][0]["role"] == "system"
+    assert "testing" in data["log"][0]["content"]
+
+
+def test_v2_create_conversation_default_system_prompt(
+    client: FlaskClient, tmp_path, monkeypatch
+):
+    """Test creating a V2 conversation with a default system prompt."""
+    # Use tmp_path as workspace to avoid workspace context message
+    monkeypatch.chdir(tmp_path)
+
+    convname = f"test-server-v2-{random.randint(0, 1000000)}"
+    response = client.put(
+        f"/api/v2/conversations/{convname}",
+        json={
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Hello, this is a test message.",
+                    "timestamp": datetime.now().isoformat(),
+                }
+            ]
+        },
+    )
+    assert response.status_code == 200
+    conversation_id = response.get_json()["conversation_id"]
+
+    response = client.get(f"/api/v2/conversations/{conversation_id}")
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data is not None
+    assert "log" in data
+    assert (
+        len(data["log"]) == 2
+    )  # Only system prompt + user message (no workspace context)
+    assert data["log"][0]["role"] == "system"  # Primary system prompt
+    assert data["log"][1]["role"] == "user"
+    assert data["log"][1]["content"] == "Hello, this is a test message."
+
+    # Check that the system prompt is the default one
+    prompt_msgs = get_prompt(
+        tools=[t for t in get_toolchain(None)],
+        interactive=True,
+        tool_format="markdown",
+        model=None,
+        prompt="full",
+        workspace=tmp_path,
+    )
+    assert data["log"][0]["content"] == prompt_msgs[0].content
 
 
 def test_v2_conversation_post(v2_conv, client: FlaskClient):
@@ -113,9 +156,11 @@ def test_v2_conversation_post(v2_conv, client: FlaskClient):
     # Verify message was added
     response = client.get(f"/api/v2/conversations/{conversation_id}")
     data = response.get_json()
-    assert len(data["log"]) == 2
-    assert data["log"][1]["role"] == "user"
-    assert data["log"][1]["content"] == "Hello, this is a test message."
+    # Should have system messages + the user message we just added
+    assert len(data["log"]) >= 2  # At least custom system prompt + user message
+    # Last message should be the user message we added
+    assert data["log"][-1]["role"] == "user"
+    assert data["log"][-1]["content"] == "Hello, this is a test message."
 
 
 @pytest.mark.slow

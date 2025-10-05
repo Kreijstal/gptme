@@ -5,7 +5,6 @@ import os
 import re
 import shutil
 import subprocess
-import time
 import urllib
 import urllib.parse
 from collections import Counter
@@ -18,6 +17,12 @@ from ..config import get_config
 from ..message import Message
 from ..tools import has_tool
 from ..tools.browser import read_url
+from .gh import (
+    get_github_issue_content,
+    get_github_pr_content,
+    parse_github_url,
+    transform_github_url,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -36,39 +41,10 @@ def use_fresh_context() -> bool:
     return flag.lower() in ("1", "true", "yes")
 
 
-def use_checks() -> bool:
-    """Check if pre-commit checks are enabled.
-
-    Pre-commit checks are enabled when either:
-    1. GPTME_CHECK=true is set explicitly, or
-    2. A .pre-commit-config.yaml file exists in any parent directory
-
-    Any issues found are included in the context, helping catch and fix code quality
-    issues before the user continues the conversation.
-    """
-    flag: str = get_config().get_env("GPTME_CHECK", "")  # type: ignore
-    explicit_enabled = flag.lower() in ("1", "true", "yes")
-    explicit_disabled = flag.lower() in ("0", "false", "no")
-    if explicit_disabled:
-        return False
-
-    # Check for .pre-commit-config.yaml in any parent directory
-    has_config = any(
-        parent.joinpath(".pre-commit-config.yaml").exists()
-        for parent in [Path.cwd(), *Path.cwd().parents]
-    )
-
-    if explicit_enabled and not has_config:
-        logger.warning(
-            "GPTME_CHECK is enabled but no .pre-commit-config.yaml found in any parent directory"
-        )
-
-    return explicit_enabled or has_config
-
-
 def file_to_display_path(f: Path, workspace: Path | None = None) -> Path:
     """
     Determine how to display the path:
+
     - If file and pwd is in workspace, show path relative to pwd
     - Otherwise, show absolute path
     """
@@ -234,7 +210,10 @@ def get_mentioned_files(msgs: list[Message], workspace: Path | None) -> list[Pat
 
 
 def gather_fresh_context(
-    msgs: list[Message], workspace: Path | None, git=True
+    msgs: list[Message],
+    workspace: Path | None,
+    git=True,
+    precommit=False,
 ) -> Message:
     """Gather fresh context from files and git status."""
 
@@ -242,8 +221,12 @@ def gather_fresh_context(
     sections = []
 
     # Add pre-commit check results if there are issues
-    if precommit_output := run_precommit_checks():
-        sections.append(precommit_output)
+    if precommit:
+        from ..tools.precommit import run_precommit_checks
+
+        success, precommit_output = run_precommit_checks()
+        if not success and precommit_output:
+            sections.append(precommit_output)
 
     if git and (git_status_output := git_status()):
         sections.append(git_status_output)
@@ -296,58 +279,6 @@ def get_changed_files() -> list[Path]:
     except subprocess.CalledProcessError as e:
         logger.debug(f"Error getting git diff files: {e}")
         return []
-
-
-def run_precommit_checks() -> str | None:
-    """Run pre-commit checks on modified files and return output if there are issues.
-
-    Pre-commit checks will run if either:
-    1. GPTME_CHECK=true is set explicitly, or
-    2. A .pre-commit-config.yaml file exists in any parent directory
-    """
-    if not use_checks():
-        logger.debug("Pre-commit checks not enabled")
-        return None
-
-    # cmd = "pre-commit run --files $(git ls-files -m)"
-    cmd = "pre-commit run --all-files"
-    start_time = time.monotonic()
-    logger.info(f"Running pre-commit checks: {cmd}")
-    try:
-        subprocess.run(cmd, shell=True, capture_output=True, text=True, check=True)
-        return None  # No issues found
-    except subprocess.CalledProcessError as e:
-        # if exit code is 130, it means the user interrupted the process
-        if e.returncode == 130:
-            logger.info("Pre-commit checks interrupted by user")
-            return None
-        # If no pre-commit config found
-        # Can happen in nested git repos, since we check parent dirs but pre-commit only checks the current repo.
-        if ".pre-commit-config.yaml is not a file" in e.stdout:
-            return None
-
-        logger.error(f"Pre-commit checks failed: {e}")
-        output = "Pre-commit checks failed\n\n"
-
-        # Add stdout if present
-        if e.stdout.strip():
-            output += md_codeblock("stdout", e.stdout.rstrip()) + "\n\n"
-
-        # Add stderr if present
-        if e.stderr.strip():
-            output += md_codeblock("stderr", e.stderr.rstrip()) + "\n\n"
-
-        # Add guidance about automated fixes
-        if "files were modified by this hook" in e.stdout:
-            output += "Note: Some issues were automatically fixed by the pre-commit hooks. No manual fixes needed for those changes."
-        else:
-            output += "Note: The above issues require manual fixes as they were not automatically resolved."
-
-        return output.strip()
-    finally:
-        logger.info(
-            f"Pre-commit checks completed in {time.monotonic() - start_time:.2f}s"
-        )
 
 
 def enrich_messages_with_context(
@@ -458,7 +389,16 @@ def _find_potential_paths(content: str) -> list[str]:
         List of potential paths/URLs found in the message
     """
     # Remove code blocks to avoid matching paths inside them
-    content_no_codeblocks = re.sub(r"```[\s\S]*?```", "", content)
+    # TODO: also remove paths inside XML tags
+    re_codeblock = r"````?[\s\S]*?\n````?"
+    assert re.match(
+        re_codeblock, md_codeblock("test", "test")
+    ), "Code block regex should match the md_codeblock format with quadruple backticks"
+    assert re.match(
+        re_codeblock, md_codeblock("test", "test").replace("````", "```")
+    ), "Code block regex should match the md_codeblock format with triple backticks"
+
+    content_no_codeblocks = re.sub(re_codeblock, "", content)
 
     # List current directory contents for relative path matching
     cwd_files = [f.name for f in Path.cwd().iterdir()]
@@ -510,7 +450,7 @@ def _resource_to_codeblock(prompt: str) -> str | None:
         # check if prompt is a path, if so, replace it with the contents of that file
         f = Path(prompt).expanduser()
         if f.exists() and f.is_file():
-            return f"```{prompt}\n{f.read_text()}\n```"
+            return md_codeblock(prompt, f.read_text())
     except OSError as oserr:
         # some prompts are too long to be a path, so we can't read them
         if oserr.errno == errno.ENAMETOOLONG:
@@ -549,15 +489,34 @@ def _resource_to_codeblock(prompt: str) -> str | None:
     for path in paths:
         result += _resource_to_codeblock(path) or ""
 
-    if not has_tool("browser"):
-        logger.warning("Browser tool not available, skipping URL read")
-    else:
-        for url in urls:
+    for url in urls:
+        content = None
+
+        # First try to handle GitHub issues/PRs with specialized tools
+        github_info = parse_github_url(url)
+        if github_info:
+            if github_info["type"] == "issues":
+                content = get_github_issue_content(
+                    github_info["owner"], github_info["repo"], github_info["number"]
+                )
+            elif github_info["type"] == "pull":
+                content = get_github_pr_content(url)
+
+        # If GitHub handling failed or not a GitHub issue/PR, fall back to browser
+        if not content and has_tool("browser"):
             try:
-                content = read_url(url)
-                result += f"```{url}\n{content}\n```"
+                # Transform GitHub blob URLs to raw URLs
+                transformed_url = transform_github_url(url)
+                if transformed_url != url:
+                    logger.debug(f"Transformed GitHub URL: {url} -> {transformed_url}")
+                content = read_url(transformed_url)
             except Exception as e:
                 logger.warning(f"Failed to read URL {url}: {e}")
+        elif not content and not has_tool("browser"):
+            logger.warning("Browser tool not available, skipping URL read")
+
+        if content:
+            result += md_codeblock(url, content)
 
     return result
 

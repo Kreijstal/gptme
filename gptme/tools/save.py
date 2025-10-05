@@ -5,6 +5,7 @@ Gives the assistant the ability to save whole files, or append to them.
 import re
 from collections.abc import Generator
 from pathlib import Path
+from typing import Literal
 
 from ..message import Message
 from ..util.ask_execute import execute_with_confirmation
@@ -98,21 +99,36 @@ def execute_save_impl(
     content: str, path: Path | None, confirm: ConfirmFunc
 ) -> Generator[Message, None, None]:
     """Actual save implementation."""
+    from ..hooks import HookType, trigger_hook
+
     assert path
     path_display = path
-    path = path.expanduser()
+
+    # Print full path to give agent feedback about where exactly the file is saved
+    path = path.expanduser().resolve()
+
+    # Trigger pre-save hooks
+    if pre_save_msgs := trigger_hook(
+        HookType.FILE_PRE_SAVE, path=path, content=content
+    ):
+        yield from pre_save_msgs
 
     # Ensure content ends with newline
     if not content.endswith("\n"):
         content += "\n"
 
-    # Check if file exists
+    # Check if file exists and store original content for comparison
+    overwrite = False
+    original_content = None
     if path.exists():
+        original_content = path.read_text()
         if not confirm(f"File {path_display} exists, overwrite?"):
             yield Message("system", "Save aborted: user refused to overwrite the file.")
             return
+        overwrite = True
 
     # Check if folder exists
+    missing_parent_created = False
     if not path.parent.exists():
         if not confirm(f"Folder {path_display.parent} doesn't exist, create it?"):
             yield Message(
@@ -120,11 +136,49 @@ def execute_save_impl(
             )
             return
         path.parent.mkdir(parents=True)
+        missing_parent_created = True
 
     # Save the file
     with open(path, "w") as f:
         f.write(content)
-    yield Message("system", f"Saved to {path_display}")
+
+    # Trigger post-save hooks
+    if post_save_msgs := trigger_hook(
+        HookType.FILE_POST_SAVE, path=path, content=content, created=not overwrite
+    ):
+        yield from post_save_msgs
+
+    # Check if this was an inefficient overwrite (minimal changes)
+    hint = ""
+    if overwrite and original_content:
+        try:
+            # Calculate how much actually changed
+            p = Patch(original_content, content)
+            diff = p.diff_minimal(strip_context=True)
+
+            # Count changed lines vs total lines
+            changed_lines = len(
+                [line for line in diff.split("\n") if line.startswith(("+", "-"))]
+            )
+            total_lines = len(content.split("\n"))
+
+            # Emit hint if changes are minimal relative to file size
+            # Show hint if: (< 30% changed AND > 10 lines) OR (< 5 lines changed AND > 10 lines)
+            if total_lines > 10 and (
+                changed_lines < total_lines * 0.3 or changed_lines < 5
+            ):
+                hint = "\n💡 Hint: This save barely changed the file. Consider using the patch tool for small modifications to be more efficient."
+        except Exception:
+            # If diff calculation fails, don't emit hint
+            pass
+
+    yield Message(
+        "system",
+        f"Saved to {path_display}"
+        + (" (overwritten)" if overwrite else "")
+        + (" (created missing folder)" if missing_parent_created else "")
+        + hint,
+    )
 
 
 def execute_append_impl(
@@ -168,6 +222,65 @@ def execute_append_impl(
     yield Message("system", f"Appended to {path_display}")
 
 
+def _validate_and_execute(
+    code: str | None,
+    args: list[str] | None,
+    kwargs: dict[str, str] | None,
+    confirm: ConfirmFunc,
+    operation: Literal["save", "append"],
+) -> Generator[Message, None, None]:
+    """Common validation and execution logic for save and append operations."""
+    # Get content from kwargs if available (tool format), otherwise use code (markdown format)
+    content = kwargs.get("content") if kwargs else None
+    if not content:
+        content = code
+
+    if not content:
+        yield Message("system", "No content provided")
+        return
+
+    # Use content instead of code for the rest of the function
+    code = content
+
+    if check_for_placeholders(code):
+        action = "Save" if operation == "save" else "Append"
+        yield Message(
+            "system",
+            f"{action} aborted: Content contains placeholder lines (e.g. '# ...' or '// ...'). "
+            "Please provide the complete content"
+            + (
+                ""
+                if operation == "append"
+                else " or use the patch tool for partial changes"
+            )
+            + ".",
+        )
+        return
+
+    path = get_path(code, args, kwargs)
+    if not path:
+        yield Message("system", "No path provided")
+        return
+
+    preview_lang = "diff" if path.exists() else None
+    confirm_msg = f"Save to {path}?" if operation == "save" else f"Append to {path}?"
+    execute_fn = execute_save_impl if operation == "save" else execute_append_impl
+    preview_fn = preview_save if operation == "save" else preview_append
+
+    yield from execute_with_confirmation(
+        code,
+        args,
+        kwargs,
+        confirm,
+        execute_fn=execute_fn,
+        get_path_fn=get_path,
+        preview_fn=preview_fn,
+        preview_lang=preview_lang,
+        confirm_msg=confirm_msg,
+        allow_edit=True,
+    )
+
+
 def execute_save(
     code: str | None,
     args: list[str] | None,
@@ -175,31 +288,7 @@ def execute_save(
     confirm: ConfirmFunc,
 ) -> Generator[Message, None, None]:
     """Save code to a file."""
-    if not code:
-        yield Message("system", "No content provided")
-        return
-
-    if check_for_placeholders(code):
-        yield Message(
-            "system",
-            "Save aborted: Content contains placeholder lines (e.g. '# ...' or '// ...'). "
-            "Please provide the complete content or use the patch tool for partial changes.",
-        )
-        return
-
-    # Only proceed with confirmation if no placeholders were found
-    yield from execute_with_confirmation(
-        code,
-        args,
-        kwargs,
-        confirm,
-        execute_fn=execute_save_impl,
-        get_path_fn=get_path,
-        preview_fn=preview_save,
-        preview_lang="diff" if get_path(code, args, kwargs).exists() else None,
-        confirm_msg=f"Save to {get_path(code, args, kwargs)}?",
-        allow_edit=True,
-    )
+    yield from _validate_and_execute(code, args, kwargs, confirm, "save")
 
 
 def execute_append(
@@ -209,36 +298,7 @@ def execute_append(
     confirm: ConfirmFunc,
 ) -> Generator[Message, None, None]:
     """Append code to a file."""
-    if not code:
-        yield Message("system", "No content provided")
-        return
-
-    if check_for_placeholders(code):
-        yield Message(
-            "system",
-            "Append aborted: Content contains placeholder lines (e.g. '# ...' or '// ...'). "
-            "Please provide the complete content to append.",
-        )
-        return
-
-    path = get_path(code, args, kwargs)
-    if not path:
-        yield Message("system", "No path provided")
-        return
-
-    # Only proceed with confirmation if no placeholders were found
-    yield from execute_with_confirmation(
-        code,
-        args,
-        kwargs,
-        confirm,
-        execute_fn=execute_append_impl,
-        get_path_fn=get_path,
-        preview_fn=preview_append,
-        preview_lang="diff" if path.exists() else None,  # Only show diff if file exists
-        confirm_msg=f"Append to {path}?",
-        allow_edit=True,
-    )
+    yield from _validate_and_execute(code, args, kwargs, confirm, "append")
 
 
 tool_save = ToolSpec(

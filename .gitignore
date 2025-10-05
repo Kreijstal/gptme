@@ -1,6 +1,4 @@
-.env*
-.clean
-
+# venvs
 venv
 .venv
 
@@ -23,17 +21,28 @@ logs*
 # fetched by make
 scripts/build_changelog.py
 
+# media files need to be force-fully added to not pollute the repo
+media/
+
 # build/test/prof/cache
+build
 dist
 prof
 tests/output
 docs/_build
+# exclude tagged versions
+docs/releases/v*-*.md
 .coverage*
 coverage.xml
 htmlcov
 junit.xml
 __pycache__
 .*cache
+.cursor
+
+# secrets
+.env*
+*.env
 
 # filetypes
 *.csv
@@ -42,7 +51,8 @@ __pycache__
 *.cast
 *.png
 .aider*
-.env
+.clean
+
 
 # if you choose to keep ~/.config/gptme/config.toml in the repo
 config.toml

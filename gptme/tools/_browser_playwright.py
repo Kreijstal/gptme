@@ -5,16 +5,38 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 import urllib.parse
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TypeVar
 
 from playwright.sync_api import Browser, ElementHandle
 
-from ._browser_thread import BrowserThread
+from ._browser_thread import BrowserThread, _is_connection_error
 
 _browser: BrowserThread | None = None
+_last_logs: dict = {"logs": [], "errors": [], "url": None}
 logger = logging.getLogger(__name__)
+
+
+def _restart_browser() -> None:
+    """Restart the browser by resetting the global instance"""
+
+    global _browser
+    start_time = time.time()
+
+    if _browser is not None:
+        try:
+            logger.debug("Stopping old browser instance...")
+            _browser.stop()
+            logger.debug(f"Browser stopped in {time.time() - start_time:.2f}s")
+        except Exception:
+            logger.debug("Error stopping old browser instance")
+        _browser = None
+
+    logger.debug(f"Browser restart completed in {time.time() - start_time:.2f}s")
 
 
 def get_browser() -> BrowserThread:
@@ -25,8 +47,39 @@ def get_browser() -> BrowserThread:
     return _browser
 
 
+T = TypeVar("T")
+
+
+def _execute_with_retry(
+    func: Callable[..., T], *args, max_retries: int = 1, **kwargs
+) -> T:
+    """Execute a browser function with automatic retry on connection failures"""
+    last_error: Exception | None = None
+
+    for attempt in range(max_retries + 1):
+        try:
+            browser = get_browser()
+            return browser.execute(func, *args, **kwargs)
+
+        except Exception as e:
+            last_error = e
+
+            if _is_connection_error(e) and attempt < max_retries:
+                logger.info("Browser connection failed, restarting browser...")
+                _restart_browser()
+                continue
+            else:
+                break
+
+    # last_error will never be None here since we only break after setting it
+    assert last_error is not None
+    raise last_error
+
+
 def _load_page(browser: Browser, url: str) -> str:
-    """Load a page and return its body HTML"""
+    """Load a page and return its body HTML, always capturing logs"""
+    global _last_logs
+
     context = browser.new_context(
         locale="en-US",
         geolocation={"latitude": 37.773972, "longitude": 13.39},
@@ -35,16 +88,72 @@ def _load_page(browser: Browser, url: str) -> str:
 
     logger.info(f"Loading page: {url}")
     page = context.new_page()
-    page.goto(url)
+
+    # Always capture logs
+    logs = []
+    page_errors = []
+
+    def on_console(msg):
+        logs.append(
+            {
+                "type": msg.type,
+                "text": msg.text,
+                "location": f"{msg.location.get('url', 'unknown')}:{msg.location.get('lineNumber', 'unknown')}:{msg.location.get('columnNumber', 'unknown')}"
+                if msg.location
+                else "unknown",
+            }
+        )
+
+    def on_page_error(error):
+        page_errors.append(f"Page error: {error}")
+
+    page.on("console", on_console)
+    page.on("pageerror", on_page_error)
+
+    # Navigate to the page
+    try:
+        page.goto(url)
+        # Wait for page to be fully loaded (includes network idle)
+        page.wait_for_load_state("networkidle")
+    except Exception as e:
+        page_errors.append(f"Navigation error: {str(e)}")
+        # Don't re-raise, just capture the error
+
+    # Store logs globally
+    _last_logs = {"logs": logs, "errors": page_errors, "url": url}
 
     return page.inner_html("body")
 
 
 def read_url(url: str) -> str:
     """Read the text of a webpage and return the text in Markdown format."""
-    browser = get_browser()
-    body_html = browser.execute(_load_page, url)
+    body_html = _execute_with_retry(_load_page, url)
     return html_to_markdown(body_html)
+
+
+def read_logs() -> str:
+    """Read browser console logs from the last read URL."""
+    global _last_logs
+
+    if not _last_logs["url"]:
+        return "No URL has been read yet."
+
+    result = [f"=== Logs for {_last_logs['url']} ==="]
+
+    if _last_logs["logs"]:
+        result.append("\n=== Console Logs ===")
+        for log in _last_logs["logs"]:
+            result.append(f"[{log['type'].upper()}] {log['text']} ({log['location']})")
+
+    if _last_logs["errors"]:
+        result.append("\n=== Page Errors ===")
+        for error in _last_logs["errors"]:
+            result.append(error)
+
+    if not _last_logs["logs"] and not _last_logs["errors"]:
+        result.append("\nNo logs or errors captured.")
+
+    return "\n".join(result)
 
 
 def _search_google(browser: Browser, query: str) -> str:
@@ -70,12 +179,11 @@ def _search_google(browser: Browser, query: str) -> str:
 
 
 def search_google(query: str) -> str:
-    browser = get_browser()
-    return browser.execute(_search_google, query)
+    return _execute_with_retry(_search_google, query)
 
 
 def _search_duckduckgo(browser: Browser, query: str) -> str:
-    url = f"https://duckduckgo.com/?q={query}"
+    url = f"https://html.duckduckgo.com/html?q={query}"
 
     context = browser.new_context(
         locale="en-US",
@@ -89,8 +197,7 @@ def _search_duckduckgo(browser: Browser, query: str) -> str:
 
 
 def search_duckduckgo(query: str) -> str:
-    browser = get_browser()
-    return browser.execute(_search_duckduckgo, query)
+    return _execute_with_retry(_search_duckduckgo, query)
 
 
 @dataclass
@@ -171,15 +278,21 @@ def _list_results_google(page) -> str:
 
 
 def _list_results_duckduckgo(page) -> str:
+    if "Unfortunately, bots use DuckDuckGo too" in page.inner_text("body"):
+        logger.error("Blocked by DuckDuckGo bot detection")
+        logger.debug(f"{page.inner_text('body')=}")
+        return "Error: blocked by DuckDuckGo bot detection."
+
     # fetch the results
-    results = page.query_selector(".react-results--main")
+    sel_results = "div#links"
+    results = page.query_selector(sel_results)
     if not results:
-        logger.error("Unable to find selector `.react-results--main` in results")
+        logger.error(f"Unable to find selector `{sel_results}` with results")
         logger.debug(f"{page.inner_text('body')=}")
         return "Error: something went wrong with the search."
-    results = results.query_selector_all("article")
+    results = results.query_selector_all(".result")
     if not results:
-        logger.error("Unable to find selector `article` in results")
+        logger.error("Unable to find selector `.result` in results")
         logger.debug(f"{page.inner_text('body')=}")
         return "Error: something went wrong with the search."
 
@@ -216,8 +329,7 @@ def _take_screenshot(
 def screenshot_url(url: str, path: Path | str | None = None) -> Path:
     """Take a screenshot of a webpage and save it to a file."""
     logger.info(f"Taking screenshot of '{url}' and saving to '{path}'")
-    browser = get_browser()
-    path = browser.execute(_take_screenshot, url, path)
+    path = _execute_with_retry(_take_screenshot, url, path)
     print(f"Screenshot saved to {path}")
     return path
 

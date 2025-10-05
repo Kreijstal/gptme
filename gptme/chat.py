@@ -1,17 +1,9 @@
 import logging
 import os
 import sys
-try:
-    import termios
-except ImportError:
-    termios = None  # type: ignore
-
-msvcrt = None
-if os.name == 'nt':
-    import msvcrt
+import termios
 from collections.abc import Generator
 from pathlib import Path
-from typing import cast
 
 from .commands import execute_cmd
 from .config import get_config
@@ -21,7 +13,7 @@ from .llm import reply
 from .llm.models import get_default_model, get_model
 from .logmanager import Log, LogManager, prepare_messages
 from .message import Message
-from .prompts import get_workspace_prompt
+from .telemetry import trace_function
 from .tools import (
     ConfirmFunc,
     ToolFormat,
@@ -31,33 +23,33 @@ from .tools import (
     has_tool,
     set_tool_format,
 )
-from .tools.tts import (
-    audio_queue,
-    speak,
-    stop,
-    tts_request_queue,
-)
-from .util import console, path_with_tilde, print_bell
+from .tools.tts import speak, stop, tts_request_queue
+from .util import console, path_with_tilde
 from .util.ask_execute import ask_execute
-from .util.context import include_paths, run_precommit_checks
+from .util.context import include_paths
 from .util.cost import log_costs
 from .util.interrupt import clear_interruptible, set_interruptible
 from .util.prompt import add_history, get_input
+from .util.sound import print_bell, wait_for_audio
 from .util.terminal import set_current_conv_name, terminal_state_title
 
 logger = logging.getLogger(__name__)
 
+# Global flag to track if we were recently interrupted
+_recently_interrupted = False
 
+
+@trace_function(name="chat.main", attributes={"component": "chat"})
 def chat(
     prompt_msgs: list[Message],
     initial_msgs: list[Message],
     logdir: Path,
+    workspace: Path,
     model: str | None,
     stream: bool = True,
     no_confirm: bool = False,
     interactive: bool = True,
     show_hidden: bool = False,
-    workspace: Path | None = None,
     tool_allowlist: list[str] | None = None,
     tool_format: ToolFormat | None = None,
 ) -> None:
@@ -70,12 +62,28 @@ def chat(
 
     Callable from other modules.
     """
+    global _recently_interrupted
+    _recently_interrupted = False
+
     # Set initial terminal title with conversation name
     conv_name = logdir.name
     set_current_conv_name(conv_name)
 
     # init
     init(model, interactive, tool_allowlist)
+
+    # Trigger session start hooks
+    from .hooks import HookType, trigger_hook
+
+    if session_start_msgs := trigger_hook(
+        HookType.SESSION_START,
+        logdir=logdir,
+        workspace=workspace,
+        initial_msgs=initial_msgs,
+    ):
+        # Process any messages from session start hooks
+        for hook_msg in session_start_msgs:
+            console.log(f"[Session start hook] {hook_msg.content[:100]}...")
 
     default_model = get_default_model()
     assert default_model is not None, "No model loaded and no model specified"
@@ -88,145 +96,320 @@ def chat(
         )
         stream = False
 
-    console.log(f"Using logdir {path_with_tilde(logdir)}")
+    console.log(f"Using logdir: {path_with_tilde(logdir)}")
     manager = LogManager.load(logdir, initial_msgs=initial_msgs, create=True)
 
-    config = get_config()
-    tool_format_with_default: ToolFormat = tool_format or cast(
-        ToolFormat, config.get_env("TOOL_FORMAT", "markdown")
-    )
+    # Note: todowrite replay is now handled by the todo_replay tool via SESSION_START hook
+
+    # tool_format should already be resolved by this point
+    assert (
+        tool_format is not None
+    ), "tool_format should be resolved before calling chat()"
 
     # By defining the tool_format at the last moment we ensure we can use the
     # configuration for subagent
-    set_tool_format(tool_format_with_default)
+    set_tool_format(tool_format)
 
     # Initialize workspace
-    workspace = _init_workspace(workspace, logdir)
-    console.log(f"Using workspace at {path_with_tilde(workspace)}")
+    console.log(f"Using workspace: {path_with_tilde(workspace)}")
     os.chdir(workspace)
-
-    workspace_prompt = get_workspace_prompt(workspace)
-    # FIXME: this is hacky
-    # NOTE: needs to run after the workspace is set
-    # check if message is already in log, such as upon resume
-    if (
-        workspace_prompt
-        and workspace_prompt not in [m.content for m in manager.log]
-        and "user" not in [m.role for m in manager.log]
-    ):
-        manager.append(Message("system", workspace_prompt, hide=True, quiet=True))
 
     # print log
     manager.log.print(show_hidden=show_hidden)
     console.print("--- ^^^ past messages ^^^ ---")
+
+    # Note: todowrite replay is now handled by the todo_replay tool via SESSION_START hook
 
     def confirm_func(msg) -> bool:
         if no_confirm:
             return True
         return ask_execute(msg)
 
+    # Convert prompt_msgs to a queue for unified handling
+    prompt_queue = list(prompt_msgs)
+
+    # Import SessionCompleteException for clean exit handling
+    from .tools.complete import SessionCompleteException
+
     # main loop
+    try:
+        _run_chat_loop(
+            manager,
+            prompt_queue,
+            stream,
+            confirm_func,
+            tool_format,
+            workspace,
+            model,
+            interactive,
+            logdir,
+        )
+    except SessionCompleteException:
+        console.log("Autonomous mode: Complete tool detected. Exiting cleanly.")
+        _wait_for_tts_if_enabled()
+
+        # Trigger session end hooks
+        if session_end_msgs := trigger_hook(
+            HookType.SESSION_END, logdir=logdir, manager=manager
+        ):
+            for msg in session_end_msgs:
+                manager.append(msg)
+        return
+
+
+def _run_chat_loop(
+    manager,
+    prompt_queue,
+    stream,
+    confirm_func,
+    tool_format,
+    workspace,
+    model,
+    interactive,
+    logdir,
+):
+    """Main chat loop - extracted to allow clean exception handling."""
+    from .hooks import HookType, trigger_hook
+
     while True:
-        # if prompt_msgs given, process each prompt fully before moving to the next
-        if prompt_msgs:
-            while prompt_msgs:
-                msg = prompt_msgs.pop(0)
+        msg: Message | None = None
+        try:
+            # Process next message (either from prompt queue or user input)
+            if prompt_queue:
+                msg = prompt_queue.pop(0)
+                assert msg is not None, "prompt_queue contained None"
                 msg = include_paths(msg, workspace)
                 manager.append(msg)
-                # if prompt is a user-command, execute it
+
+                # Handle user commands
                 if msg.role == "user" and execute_cmd(msg, manager, confirm_func):
                     continue
 
-                # Generate and execute response for this prompt
-                while True:
-                    try:
-                        set_interruptible()
-                        response_msgs = list(
-                            step(
-                                manager.log,
-                                stream,
-                                confirm_func,
-                                tool_format=tool_format_with_default,
-                                workspace=workspace,
-                                model=model,
-                            )
+                # Process the message and get response
+                _process_message_conversation(
+                    manager, stream, confirm_func, tool_format, workspace, model
+                )
+            else:
+                # Get user input or exit if non-interactive
+                if not interactive:
+                    logger.debug("Non-interactive and exhausted prompts")
+                    _wait_for_tts_if_enabled()
+                    break
+
+                user_input = _get_user_input(manager.log, workspace)
+                if user_input is None:
+                    # Either user wants to exit OR we should generate response directly
+                    if _should_prompt_for_input(manager.log):
+                        # User wants to exit
+                        break
+                    else:
+                        # Don't prompt for input, generate response directly (crash recovery, etc.)
+                        # Process existing log without adding new message
+                        _process_message_conversation(
+                            manager,
+                            stream,
+                            confirm_func,
+                            tool_format,
+                            workspace,
+                            model,
                         )
-                    except KeyboardInterrupt:
-                        console.log("Interrupted. Stopping current execution.")
-                        manager.append(Message("system", INTERRUPT_CONTENT))
-                        break
-                    finally:
-                        clear_interruptible()
+                else:
+                    # Normal case: user provided input
+                    msg = user_input
+                    manager.append(msg)
 
-                    for response_msg in response_msgs:
-                        manager.append(response_msg)
-                        # run any user-commands, if msg is from user
-                        if response_msg.role == "user" and execute_cmd(
-                            response_msg, manager, confirm_func
-                        ):
-                            break
+                    # Reset interrupt flag since user provided new input
+                    _recently_interrupted = False
 
-                    # Check if there are any runnable tools left
-                    last_content = next(
-                        (
-                            m.content
-                            for m in reversed(manager.log)
-                            if m.role == "assistant"
-                        ),
-                        "",
+                    # Handle user commands
+                    if msg.role == "user" and execute_cmd(msg, manager, confirm_func):
+                        continue
+
+                    # Process the message and get response
+                    _process_message_conversation(
+                        manager,
+                        stream,
+                        confirm_func,
+                        tool_format,
+                        workspace,
+                        model,
                     )
-                    has_runnable = any(
-                        tooluse.is_runnable
-                        for tooluse in ToolUse.iter_from_content(last_content)
-                    )
-                    if not has_runnable:
-                        break
 
-            # All prompts processed, continue to next iteration
+            # Trigger LOOP_CONTINUE hooks to check if we should continue/exit
+            # This handles auto-reply mechanism and other loop control logic
+            if loop_msgs := trigger_hook(
+                HookType.LOOP_CONTINUE,
+                log=manager.log,
+                workspace=workspace,
+                manager=manager,
+                interactive=interactive,
+                prompt_queue=prompt_queue,
+            ):
+                for msg in loop_msgs:
+                    # Add hook-generated messages to prompt queue
+                    prompt_queue.append(msg)
+                    console.log(f"[Loop control] {msg.content[:100]}...")
+                continue  # Process the queued messages
+
+        except KeyboardInterrupt:
+            console.log("Interrupted.")
+            _recently_interrupted = True
+            manager.append(Message("system", INTERRUPT_CONTENT))
+            # Clear any remaining prompts to avoid confusion
+            prompt_queue.clear()
             continue
 
-        # if:
-        #  - prompts exhausted
-        #  - non-interactive
-        #  - no executable block in last assistant message
-        # then exit
-        elif not interactive:
-            logger.debug("Non-interactive and exhausted prompts")
-            if has_tool("tts") and os.environ.get("GPTME_VOICE_FINISH", "").lower() in [
-                "1",
-                "true",
-            ]:
-                logger.info("Waiting for TTS to finish...")
+    # Trigger session end hooks when exiting normally
+    if session_end_msgs := trigger_hook(
+        HookType.SESSION_END, logdir=logdir, manager=manager
+    ):
+        for msg in session_end_msgs:
+            manager.append(msg)
 
-                set_interruptible()
-                try:
-                    # Wait for all TTS processing to complete
-                    tts_request_queue.join()
-                    logger.info("tts request queue joined")
-                    # Then wait for all audio to finish playing
-                    audio_queue.join()
-                    logger.info("audio queue joined")
-                except KeyboardInterrupt:
-                    logger.info("Interrupted while waiting for TTS")
 
-                    stop()
+def _process_message_conversation(
+    manager: LogManager,
+    stream: bool,
+    confirm_func: ConfirmFunc,
+    tool_format: ToolFormat,
+    workspace: Path,
+    model: str | None,
+) -> None:
+    """Process a message and generate responses until no more tools to run."""
+    from .hooks import HookType, trigger_hook
+
+    while True:
+        try:
+            set_interruptible()
+
+            # Trigger pre-process hooks
+            if pre_msgs := trigger_hook(
+                HookType.MESSAGE_PRE_PROCESS, log=manager.log, workspace=workspace
+            ):
+                for msg in pre_msgs:
+                    manager.append(msg)
+
+            response_msgs = list(
+                step(
+                    manager.log,
+                    stream,
+                    confirm_func,
+                    tool_format=tool_format,
+                    workspace=workspace,
+                    model=model,
+                )
+            )
+        except KeyboardInterrupt:
+            console.log("Interrupted during response generation.")
+            global _recently_interrupted
+            _recently_interrupted = True
+            manager.append(Message("system", INTERRUPT_CONTENT))
+            break
+        finally:
+            clear_interruptible()
+
+        for response_msg in response_msgs:
+            manager.append(response_msg)
+            # run any user-commands, if msg is from user
+            if response_msg.role == "user" and execute_cmd(
+                response_msg, manager, confirm_func
+            ):
+                return
+
+        # Check if there are any runnable tools left
+        last_content = next(
+            (m.content for m in reversed(manager.log) if m.role == "assistant"),
+            "",
+        )
+        has_runnable = any(
+            tooluse.is_runnable for tooluse in ToolUse.iter_from_content(last_content)
+        )
+        if not has_runnable:
             break
 
-        # ask for input if no prompt, generate reply, and run tools
-        clear_interruptible()  # Ensure we're not interruptible during user input
-        for msg in step(
-            manager.log,
-            stream,
-            confirm_func,
-            tool_format=tool_format_with_default,
-            workspace=workspace,
-        ):  # pragma: no cover
+    # Trigger post-process hooks after message processing completes
+    # Note: pre-commit checks and autocommit are now handled by hooks
+    if post_msgs := trigger_hook(
+        HookType.MESSAGE_POST_PROCESS,
+        log=manager.log,
+        workspace=workspace,
+        manager=manager,
+    ):
+        for msg in post_msgs:
             manager.append(msg)
-            # run any user-commands, if msg is from user
-            if msg.role == "user" and execute_cmd(msg, manager, confirm_func):
-                break
 
 
+def _should_prompt_for_input(log: Log) -> bool:
+    """
+    Determine if we should ask for user input or generate response directly.
+
+    Returns True if we should prompt for input, False if we should generate response.
+    This preserves the original logic for handling edge cases like crash recovery.
+    """
+    last_msg = log[-1] if log else None
+
+    # Ask for input when:
+    # - No messages at all
+    # - Last message was from assistant (normal flow)
+    # - Last message was an interrupt
+    # - Last message was pinned
+    # - No user messages exist in the entire log
+    return (
+        not last_msg
+        or (last_msg.role in ["assistant"])
+        or last_msg.content == INTERRUPT_CONTENT
+        or last_msg.pinned
+        or not any(role == "user" for role in [m.role for m in log])
+    )
+
+
+def _get_user_input(log: Log, workspace: Path | None) -> Message | None:
+    """Get user input, returning None if user wants to exit."""
+    clear_interruptible()  # Don't interrupt during user input
+
+    # Check if we should prompt for input or generate response directly
+    if not _should_prompt_for_input(log):
+        # Last message was from user (crash recovery, edited log, etc.)
+        # Don't ask for input, let the system generate a response
+        return None
+
+    # print diff between now and last user message timestamp
+    if get_config().get_env_bool("GPTME_SHOW_WORKED"):
+        last_user_msg = next((m for m in reversed(log) if m.role == "user"), None)
+        if last_user_msg and log:
+            diff = log[-1].timestamp - last_user_msg.timestamp
+            console.log(f"Worked for {diff.total_seconds():.2f} seconds")
+
+    try:
+        inquiry = prompt_user()
+        msg = Message("user", inquiry, quiet=True)
+        msg = include_paths(msg, workspace)
+        return msg
+    except (EOFError, KeyboardInterrupt):
+        return None
+
+
+def _wait_for_tts_if_enabled() -> None:
+    """Wait for TTS to finish if enabled."""
+    if has_tool("tts") and os.environ.get("GPTME_VOICE_FINISH", "").lower() in [
+        "1",
+        "true",
+    ]:
+        logger.info("Waiting for TTS to finish...")
+        set_interruptible()
+        try:
+            # Wait for all TTS processing to complete
+            tts_request_queue.join()
+            logger.info("tts request queue joined")
+            # Then wait for all audio to finish playing
+            wait_for_audio()
+            logger.info("audio playback finished")
+        except KeyboardInterrupt:
+            logger.info("Interrupted while waiting for TTS")
+            stop()
+
+
+@trace_function(name="chat.step", attributes={"component": "chat"})
 def step(
     log: Log | list[Message],
     stream: bool,
@@ -235,43 +418,16 @@ def step(
     workspace: Path | None = None,
     model: str | None = None,
 ) -> Generator[Message, None, None]:
-    """Runs a single pass of the chat."""
+    """Runs a single pass of the chat - generates response and executes tools."""
+    global _recently_interrupted
+
     default_model = get_default_model()
     assert default_model is not None, "No model loaded and no model specified"
     model = model or default_model.full
     if isinstance(log, list):
         log = Log(log)
 
-    # Check if we have any recent file modifications, and if so, run lint checks
-    if not any(
-        tooluse.is_runnable
-        for tooluse in ToolUse.iter_from_content(
-            next((m.content for m in reversed(log) if m.role == "assistant"), "")
-        )
-    ):
-        # Only check for modifications if the last assistant message has no runnable tools
-        if check_for_modifications(log) and (failed_check_message := check_changes()):
-            yield Message("system", failed_check_message, quiet=False)
-            return
-
-    # If last message was a response, ask for input.
-    # If last message was from the user (such as from crash/edited log),
-    # then skip asking for input and generate response
-    last_msg = log[-1] if log else None
-    if (
-        not last_msg
-        or (last_msg.role in ["assistant"])
-        or last_msg.content == INTERRUPT_CONTENT
-        or last_msg.pinned
-        or not any(role == "user" for role in [m.role for m in log])
-    ):  # pragma: no cover
-        inquiry = prompt_user()
-        msg = Message("user", inquiry, quiet=True)
-        msg = include_paths(msg, workspace)
-        yield msg
-        log = log.append(msg)
-
-    # generate response and run tools
+    # Generate response and run tools
     try:
         set_interruptible()
 
@@ -280,12 +436,12 @@ def step(
 
         tools = None
         if tool_format == "tool":
-            tools = [t for t in get_tools() if t.is_runnable()]
+            tools = [t for t in get_tools() if t.is_runnable]
 
         # generate response
         with terminal_state_title("🤔 generating"):
             msg_response = reply(msgs, get_model(model).full, stream, tools)
-            if os.environ.get("GPTME_COSTS") in ["1", "true"]:
+            if get_config().get_env_bool("GPTME_COSTS"):
                 log_costs(msgs + [msg_response])
 
         # speak if TTS tool is available
@@ -296,18 +452,19 @@ def step(
         if msg_response:
             yield msg_response.replace(quiet=True)
             yield from execute_msg(msg_response, confirm)
+
+        # Reset interrupt flag after successful completion
+        _recently_interrupted = False
+
     finally:
         clear_interruptible()
 
 
 def prompt_user(value=None) -> str:  # pragma: no cover
     print_bell()
-    # Flush stdin to clear any buffered input before prompting
-    if termios:
+    # Flush stdin to clear any buffered input before prompting (only if stdin is a TTY)
+    if sys.stdin.isatty():
         termios.tcflush(sys.stdin, termios.TCIFLUSH)
-    elif msvcrt:
-        while msvcrt.kbhit():
-            msvcrt.getch()
     response = ""
     with terminal_state_title("⌨️ waiting for input"):
         while not response:
@@ -338,46 +495,25 @@ def prompt_input(prompt: str, value=None) -> str:  # pragma: no cover
 def check_for_modifications(log: Log) -> bool:
     """Check if there are any file modifications in last 3 messages or since last user message."""
     messages_since_user = []
+    found_user_message = False
+
     for m in reversed(log):
         if m.role == "user":
+            found_user_message = True
             break
         messages_since_user.append(m)
 
+    # If no user message found, skip the check (only system messages so far)
+    if not found_user_message:
+        return False
+
     # FIXME: this is hacky and unreliable
     has_modifications = any(
-        tu.tool in ["save", "patch", "append"]
+        tu.tool in ["save", "patch", "append", "morph"]
         for m in messages_since_user[:3]
         for tu in ToolUse.iter_from_content(m.content)
     )
     # logger.debug(
-    #     f"Found {len(messages_since_user)} messages since user ({has_modifications=})"
+    #     f"Found {len(messages_since_user)} messages since user ({found_user_message=}, {has_modifications=})"
     # )
     return has_modifications
-
-
-def check_changes() -> str | None:
-    """Run lint/pre-commit checks after file modifications."""
-    return run_precommit_checks()
-
-
-def _init_workspace(workspace: Path | None, logdir: Path | None = None) -> Path:
-    """Initialize workspace and return the workspace path.
-
-    If workspace is None, use current directory.
-    If logdir is provided, use ``$logdir/workspace`` as workspace if it exists, else create a symlink to workspace.
-    """
-    if not workspace:
-        workspace = Path.cwd()
-
-    if logdir:
-        log_workspace = logdir / "workspace"
-        if log_workspace.exists():
-            assert not workspace or (
-                workspace == log_workspace.resolve()
-            ), f"Workspace already exists in {log_workspace}, wont override."
-            workspace = log_workspace.resolve()
-        else:
-            assert workspace.exists(), f"Workspace path {workspace} does not exist"
-            log_workspace.symlink_to(workspace, target_is_directory=True)
-
-    return workspace

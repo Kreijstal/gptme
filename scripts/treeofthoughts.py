@@ -25,8 +25,8 @@ from gptme.tools import get_tools
 from gptme.util.context import (
     gather_fresh_context,
     get_changed_files,
-    run_precommit_checks,
 )
+from gptme.tools.precommit import run_precommit_checks
 from lxml import etree
 
 # Set up logging
@@ -110,7 +110,7 @@ def main():
     prompt = sys.argv[1] if len(sys.argv) > 1 else "What is fib(10)?"
     prompts = [Message("user", prompt)]
     tools = get_tools()
-    initial_msgs = [get_prompt(tools, prompt="full", interactive=False)]
+    initial_msgs = get_prompt(tools, prompt="full", interactive=False)
     log = Log(initial_msgs + prompts)
 
     # Main loop for autonomous operation

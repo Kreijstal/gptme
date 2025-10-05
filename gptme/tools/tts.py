@@ -33,10 +33,14 @@ import queue
 import re
 import socket
 import threading
+from functools import lru_cache
 
 import requests
 
 from ..util import console
+from ..util.sound import is_audio_available, play_audio_data
+from ..util.sound import set_volume as set_audio_volume
+from ..util.sound import stop_audio
 from .base import ToolSpec
 
 # Setup logging
@@ -45,31 +49,41 @@ log = logging.getLogger(__name__)
 host = "localhost"
 port = 8000
 
-# fmt: off
+# Check for TTS-specific imports
+has_tts_imports = False
 try:
-    import numpy as np  # fmt: skip
     import scipy.io.wavfile as wavfile  # fmt: skip
-    import scipy.signal as signal  # fmt: skip
-    import sounddevice as sd  # fmt: skip
+
+    has_tts_imports = True
+except (ImportError, OSError):
+    has_tts_imports = False
+
+
+@lru_cache
+def is_available() -> bool:
+    """Check if the TTS server is available."""
+    if not has_tts_imports or not is_audio_available():
+        # console.log("TTS tool not available: missing dependencies")
+        return False
 
     # available if a server is running on localhost:8000
-    _available = socket.socket(socket.AF_INET, socket.SOCK_STREAM).connect_ex((host, port)) == 0
-    if _available:
-        console.log("TTS enabled")
+    server_available = (
+        socket.socket(socket.AF_INET, socket.SOCK_STREAM).connect_ex((host, port)) == 0
+    )
+    return server_available
+
+
+def init() -> ToolSpec:
+    if is_available():
+        console.log("Using TTS")
     else:
         console.log("TTS disabled: server not available")
-except (ImportError, OSError):
-    # will happen if tts extras not installed
-    # sounddevice may throw OSError("PortAudio library not found")
-    _available = False
-# fmt: on
+    return tool
 
-# Global queues and thread controls
-audio_queue: queue.Queue[tuple["np.ndarray", int]] = queue.Queue()
+
+# TTS-specific state
 tts_request_queue: queue.Queue[str | None] = queue.Queue()
-playback_thread: threading.Thread | None = None
 tts_processor_thread: threading.Thread | None = None
-current_volume = 1.0
 current_speed = 1.0
 
 
@@ -88,17 +102,16 @@ def set_speed(speed):
 
 def set_volume(volume):
     """Set the volume for TTS playback (0.0 to 1.0)."""
-    global current_volume
-    current_volume = max(0.0, min(1.0, volume))
-    log.info(f"TTS volume set to {current_volume:.2f}")
+    volume = max(0.0, min(1.0, volume))
+    set_audio_volume(volume)
+    log.info(f"TTS volume set to {volume:.2f}")
 
 
 def stop() -> None:
     """Stop audio playback and clear queues."""
-    sd.stop()
+    stop_audio()
 
-    # Clear both queues silently
-    clear_queue()
+    # Clear TTS request queue
     with tts_request_queue.mutex:
         tts_request_queue.queue.clear()
         tts_request_queue.all_tasks_done.notify_all()
@@ -111,16 +124,6 @@ def stop() -> None:
             tts_processor_thread.join(timeout=1)
         except RuntimeError:
             pass
-
-
-def clear_queue() -> None:
-    """Clear the audio queue without stopping current playback."""
-    while not audio_queue.empty():
-        try:
-            audio_queue.get_nowait()
-            audio_queue.task_done()
-        except queue.Empty:
-            break
 
 
 def split_text(text: str) -> list[str]:
@@ -280,109 +283,6 @@ def clean_for_speech(content: str) -> str:
     return content.strip()
 
 
-def get_output_device() -> tuple[int, int]:
-    """Get the best available output device and its sample rate.
-
-    Returns:
-        tuple: (device_index, sample_rate)
-
-    Raises:
-        RuntimeError: If no suitable output device is found
-    """
-    devices = sd.query_devices()
-    log.debug("Available audio devices:")
-    for i, dev in enumerate(devices):
-        log.debug(
-            f"  [{i}] {dev['name']} (in: {dev['max_input_channels']}, "
-            f"out: {dev['max_output_channels']}, hostapi: {dev['hostapi']})"
-        )
-
-    # Try using system default output device, preferring virtual devices
-    try:
-        default_output = sd.default.device[1]
-        if default_output is not None:
-            device_info = sd.query_devices(default_output)
-            device_name = device_info["name"].lower()
-
-            # Check if it's a virtual device (PulseAudio/PipeWire)
-            if device_info["max_output_channels"] > 0 and device_name in [
-                "pulse",
-                "pipewire",
-            ]:
-                log.debug(f"Using virtual audio device: {device_info['name']}")
-                return default_output, int(device_info["default_samplerate"])
-            else:
-                log.debug(f"Skipping non-virtual default device: {device_info['name']}")
-    except Exception as e:
-        log.debug(f"Could not use default device: {e}")
-
-    # on macOS, prefer CoreAudio (hostapi == 2)
-    output_device = next(
-        (
-            i
-            for i, d in enumerate(devices)
-            if d["max_output_channels"] > 0 and (d["hostapi"] == 2)
-        ),
-        None,
-    )
-
-    # Third try: any device with output channels
-    if output_device is None:
-        output_device = next(
-            (i for i, d in enumerate(devices) if d["max_output_channels"] > 0),
-            None,
-        )
-
-    if output_device is None:
-        raise RuntimeError(
-            "No suitable audio output device found. "
-            "Available devices:\n"
-            + "\n".join(f"  {i}: {d['name']}" for i, d in enumerate(devices))
-        )
-
-    device_info = sd.query_devices(output_device)
-    device_sr = int(device_info["default_samplerate"])
-
-    log.debug(f"Selected output device: {output_device} ({device_info['name']})")
-    log.debug(f"Sample rate: {device_sr}")
-
-    return output_device, device_sr
-
-
-def _audio_player_thread_fn() -> None:
-    """Background thread for playing audio."""
-    log.debug("Audio player thread started")
-    while True:
-        try:
-            # Get audio data from queue
-            log.debug("Waiting for audio data...")
-            data, sample_rate = audio_queue.get()
-            if data is None:  # Sentinel value to stop thread
-                log.debug("Received stop signal")
-                break
-
-            # Apply volume
-            data = data * current_volume
-            log.debug(
-                f"Playing audio: shape={data.shape}, sr={sample_rate}, vol={current_volume}"
-            )
-
-            # Get output device
-            try:
-                output_device, _ = get_output_device()
-                log.debug(f"Playing on device: {output_device}")
-            except RuntimeError as e:
-                log.error(str(e))
-                continue
-            sd.play(data, sample_rate, device=output_device)
-            sd.wait()  # Wait until audio is finished playing
-            log.debug("Finished playing audio chunk")
-
-            audio_queue.task_done()
-        except Exception as e:
-            log.error(f"Error in audio playback: {e}")
-
-
 def _tts_processor_thread_fn():
     """Background thread for processing TTS requests."""
     log.debug("TTS processor ready")
@@ -421,24 +321,8 @@ def _tts_processor_thread_fn():
             audio_data = io.BytesIO(response.content)
             sample_rate, data = wavfile.read(audio_data)
 
-            # Get output device for sample rate
-            try:
-                _, device_sr = get_output_device()
-                # Resample if needed
-                if sample_rate != device_sr:
-                    data = _resample_audio(data, sample_rate, device_sr)
-                    sample_rate = device_sr
-            except RuntimeError as e:
-                log.error(f"Device error: {e}")
-                tts_request_queue.task_done()
-                continue
-
-            # Normalize audio
-            if data.dtype != np.float32:
-                data = data.astype(np.float32) / np.iinfo(data.dtype).max
-
-            # Queue for playback
-            audio_queue.put((data, sample_rate))
+            # Play audio using the sound utility
+            play_audio_data(data, sample_rate, block=False)
             tts_request_queue.task_done()
 
         except Exception as e:
@@ -446,14 +330,9 @@ def _tts_processor_thread_fn():
             tts_request_queue.task_done()
 
 
-def ensure_threads():
-    """Ensure both playback and TTS processor threads are running."""
-    global playback_thread, tts_processor_thread
-
-    # Ensure playback thread
-    if playback_thread is None or not playback_thread.is_alive():
-        playback_thread = threading.Thread(target=_audio_player_thread_fn, daemon=True)
-        playback_thread.start()
+def ensure_tts_thread():
+    """Ensure TTS processor thread is running."""
+    global tts_processor_thread
 
     # Ensure TTS processor thread
     if tts_processor_thread is None or not tts_processor_thread.is_alive():
@@ -463,25 +342,19 @@ def ensure_threads():
         tts_processor_thread.start()
 
 
-def _resample_audio(data, orig_sr, target_sr):
-    """Resample audio data to target sample rate."""
-    if orig_sr == target_sr:
-        return data
-
-    duration = len(data) / orig_sr
-    num_samples = int(duration * target_sr)
-    return signal.resample(data, num_samples)
-
-
-def join_short_sentences(sentences: list[str], min_length: int = 100) -> list[str]:
-    """Join consecutive sentences that are shorter than min_length.
+def join_short_sentences(
+    sentences: list[str], min_length: int = 100, max_length: int | None = 300
+) -> list[str]:
+    """Join consecutive sentences that are shorter than min_length, or up to max_length.
 
     Args:
         sentences: List of sentences to potentially join
-        min_length: Minimum length threshold for joining
+        min_length: Minimum length threshold for joining short sentences
+        max_length: Maximum length for combined sentences. If specified, tries to make
+                   sentences as long as possible up to this limit
 
     Returns:
-        List of sentences, with short ones combined
+        List of sentences, with short ones combined or optimized for max length
     """
     result = []
     current = ""
@@ -497,14 +370,23 @@ def join_short_sentences(sentences: list[str], min_length: int = 100) -> list[st
         if not current:
             current = sentence
         else:
-            # Join sentences with a single space, even after punctuation
             # Join sentences with a single space after punctuation
             combined = f"{current} {sentence.lstrip()}"
-            if len(combined) <= min_length:
-                current = combined
+
+            if max_length is not None:
+                # Max length mode: combine as long as possible up to max_length
+                if len(combined) <= max_length:
+                    current = combined
+                else:
+                    result.append(current)
+                    current = sentence
             else:
-                result.append(current)
-                current = sentence
+                # Min length mode: combine only if result is still under min_length
+                if len(combined) <= min_length:
+                    current = combined
+                else:
+                    result.append(current)
+                    current = sentence
 
     if current:
         result.append(current)
@@ -551,8 +433,8 @@ def speak(text, block=False, interrupt=True, clean=True):
         chunks = join_short_sentences(split_text(text))
         chunks = [c.replace("gptme", "gpt-me") for c in chunks]  # Fix pronunciation
 
-        # Ensure both threads are running
-        ensure_threads()
+        # Ensure TTS processor thread is running
+        ensure_tts_thread()
 
         # Queue chunks for processing
         for chunk in chunks:
@@ -562,8 +444,7 @@ def speak(text, block=False, interrupt=True, clean=True):
         if block:
             # Wait for all TTS processing to complete
             tts_request_queue.join()
-            # Then wait for all audio to finish playing
-            audio_queue.join()
+            # Note: Audio playback blocking is now handled by the sound utility
 
     except Exception as e:
         log.error(f"Failed to queue text for speech: {e}")
@@ -573,6 +454,7 @@ tool = ToolSpec(
     "tts",
     desc="Text-to-speech (TTS) tool for generating audio from text.",
     instructions="Will output all assistant speech (not codeblocks, tool-uses, or other non-speech text). The assistant cannot hear the output.",
-    available=_available,
+    available=is_available,
     functions=[speak, set_speed, set_volume, stop],
+    init=init,
 )

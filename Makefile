@@ -1,4 +1,4 @@
-.PHONY: docs help check-rst
+.PHONY: docs help check-rst install-completions
 
 # set default shell
 SHELL := $(shell which bash)
@@ -14,8 +14,8 @@ help:
 SRCDIRS = gptme tests scripts
 SRCFILES_RAW = $(shell find gptme tests -name '*.py' && find scripts -name '*.py' -not -path "scripts/Kokoro-82M/*" -not -path "*/Kokoro-82M/*")
 
-# exclude files
-EXCLUDES = tests/output scripts/build_changelog.py scripts/tts_server.py
+# exclude files, such as uv scripts
+EXCLUDES = tests/output scripts/build_changelog.py scripts/tts_server.py scripts/tts_kokoro.py scripts/tts_chatterbox.py scripts/generate_sounds.py
 SRCFILES = $(shell echo "${SRCFILES_RAW}" | tr ' ' '\n' | grep -v -f <(echo "${EXCLUDES}" | tr ' ' '\n') | tr '\n' ' ')
 
 # radon args
@@ -39,6 +39,9 @@ build-docker-dev:
 build-docker-full:
 	docker build . -t gptme:latest -f scripts/Dockerfile
 	docker build . -t gptme-eval:latest -f scripts/Dockerfile.eval --build-arg RUST=yes --build-arg PLAYWRIGHT=no
+
+build-server-exe: ## Build gptme-server executable with PyInstaller
+	./scripts/build_server_executable.sh
 
 test:
 	@# if SLOW is not set, pass `-m "not slow"` to skip slow tests
@@ -78,6 +81,14 @@ precommit: format lint typecheck check-rst
 check-rst:
 	@echo "Checking RST files for proper nested list formatting..."
 	poetry run python scripts/check_rst_formatting.py docs/
+
+check-openapi: ## Validate OpenAPI specification
+	@echo "Generating OpenAPI spec..."
+	@mkdir -p build
+	poetry run gptme-server openapi -o build/openapi.json
+	@echo "Validating OpenAPI spec..."
+	poetry run openapi-spec-validator build/openapi.json
+	@echo "✅ OpenAPI spec is valid!"
 
 docs/.clean: docs/conf.py
 	poetry run make -C docs clean
@@ -127,18 +138,54 @@ version:
 
 .PHONY: dist/CHANGELOG.md
 dist/CHANGELOG.md: ./scripts/build_changelog.py
-	VERSION=$$(git describe --tags) && \
+	@# Use clean version if on tagged commit, otherwise use descriptive version
+	@POETRY_VERSION=v$$(poetry version --short) && \
+	GIT_VERSION=$$(git describe --tags) && \
+	if [ "$$POETRY_VERSION" = "$$GIT_VERSION" ]; then \
+		VERSION=$$POETRY_VERSION; \
+	else \
+		VERSION=$$GIT_VERSION; \
+	fi && \
+	make docs/releases/$${VERSION}.md && \
+	cp docs/releases/$${VERSION}.md $@
+
+docs/releases/%.md: ./scripts/build_changelog.py
+	@mkdir -p docs/changelog
+	# version is the % in the target
+	VERSION=$* && \
 	PREV_VERSION=$$(./scripts/get-last-version.sh $${VERSION}) && \
-		./scripts/build_changelog.py --range $${PREV_VERSION}...$${VERSION} --project-title gptme --org ErikBjare --repo gptme --output $@
+		./scripts/build_changelog.py --range $${PREV_VERSION}...$${VERSION} --project-title gptme --org gptme --repo gptme --output $@ --add-version-header
 
 release: version dist/CHANGELOG.md
-	@VERSION=$$(git describe --tags --abbrev=0) && \
+	# Insert new version at top of changelog toctree
+	# Stage changelog and release notes with version bump
+	# Amend version commit to include changelog
+	# Force-update tag to amended commit
+	@VERSION=v$$(poetry version --short) && \
 		echo "Releasing version $${VERSION}"; \
-		read -p "Press enter to continue" && \
-		git push origin master $${VERSION} && \
+		awk '/^   releases\// && !done { \
+			print "   releases/'"$${VERSION}"'.md"; \
+			done=1; \
+		} \
+		{print}' docs/changelog.rst > docs/changelog.rst.tmp && \
+		mv docs/changelog.rst.tmp docs/changelog.rst && \
+		git add docs/changelog.rst docs/releases/$${VERSION}.md && \
+		git commit --amend --no-edit && \
+		git tag -f $${VERSION} && \
+		echo "✓ Updated commit and tag with changelog" && \
+		read -p "Press enter to push" && \
+		git push origin master && \
+		git push origin $${VERSION} --force && \
 		gh release create $${VERSION} -t $${VERSION} -F dist/CHANGELOG.md
 
-clean: clean-docs clean-site clean-test
+install-completions: ## Install shell completions (Fish)
+	@echo "Installing shell completions..."
+	@mkdir -p ~/.config/fish/completions
+	@ln -sf $(PWD)/scripts/completions/gptme.fish ~/.config/fish/completions/gptme.fish
+	@echo "✅ Fish completions installed to ~/.config/fish/completions/"
+	@echo "Restart your shell or run 'exec fish' to enable completions"
+
+clean: clean-docs clean-site clean-test clean-build
 
 clean-site:
 	rm -rf site/dist
@@ -150,6 +197,9 @@ clean-test:
 	echo $$HOME/.local/share/gptme/logs/*test-*-test_*
 	rm -I $$HOME/.local/share/gptme/logs/*test-*-test_*/*.jsonl || true
 	rm --dir $$HOME/.local/share/gptme/logs/*test-*-test_*/ || true
+
+clean-build: ## Clean PyInstaller build artifacts
+	rm -rf build/ dist/ *.spec.bak
 
 rename-logs:
 	./scripts/auto_rename_logs.py $(if $(APPLY),--no-dry-run) --limit $(or $(LIMIT),10)
@@ -196,10 +246,18 @@ metrics:
 	@echo "Largest Files (>300 SLOC):"
 	@poetry run radon raw ${SRCFILES} | awk '/^[^ ]/ {file=$$0} /SLOC:/ {if ($$2 > 300) printf "  %4d %s\n", $$2, file}' | sort -nr
 	@echo
+	@make metrics-duplicates
+
+metrics-duplicates:
 	@echo "Most Duplicated Files:"
 	@npx jscpd gptme/** docs/**.{md,rst} scripts/**.{sh,py} | perl -pe 's/\e\[[0-9;]*m//g'
 
-bench-importtime:
-	time poetry run python -X importtime -m gptme --model openai --non-interactive 2>&1 | grep "import time" | cut -d'|' -f 2- | sort -n
+bench-import:
+	@echo "Benchmarking import time for gptme"
+	time poetry run python -X importtime -m gptme --model openai --non-interactive 2>&1 | grep "import time" | cut -d'|' -f 2- | sort -n | tail -n 10
 	@#time poetry run python -X importtime -m gptme --model openrouter --non-interactive 2>&1 | grep "import time" | cut -d'|' -f 2- | sort -n
 	@#time poetry run python -X importtime -m gptme --model anthropic --non-interactive 2>&1 | grep "import time" | cut -d'|' -f 2- | sort -n
+
+bench-startup:
+	@echo "Benchmarking startup time for gptme"
+	hyperfine "poetry run gptme '/exit'" -M 5 || poetry run gptme '/exit' || exit 1

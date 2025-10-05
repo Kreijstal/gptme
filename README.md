@@ -71,11 +71,11 @@ An unconstrained local <a href="https://gptme.org/docs/alternatives.html">altern
 ## 🎥 Demos
 
 > [!NOTE]
-> These demos are very out of date and do not reflect the latest capabilities. We hope to update them soon!
+> These demos are very out of date (2023) and do not reflect the latest capabilities.
 
 <table>
   <tr>
-    <th>Fibonacci (old)</th>
+    <th>Fibonacci</th>
     <th>Snake with curses</th>
   </tr>
   <tr>
@@ -206,6 +206,7 @@ You can find more [Demos][docs-demos] and [Examples][docs-examples] in the [docu
   - Modern web interface at [chat.gptme.org](https://chat.gptme.org) ([gptme-webui])
   - Simple built-in web UI included in the Python package
   - [Server][docs-server] with REST API
+  - Standalone executable builds available with PyInstaller
 - 💻 [Computer use][docs-tools-computer] tool, as hyped by [Anthropic][anthropic-computer-use] (see [#216](https://github.com/gptme/gptme/issues/216))
   - Give the assistant access to a full desktop, allowing it to interact with GUI applications.
 - 🤖 Long-running agents and advanced agent architectures (see [#143](https://github.com/gptme/gptme/issues/143) and [#259](https://github.com/gptme/gptme/issues/259))
@@ -218,6 +219,9 @@ You can find more [Demos][docs-demos] and [Examples][docs-examples] in the [docu
   - 📝 Automatic naming of conversations
   - ✅ Detects and integrates [pre-commit](https://github.com/pre-commit/pre-commit)
   - 🗣️ [Text-to-Speech][docs-tools-tts] support, locally generated using Kokoro
+  - 🔊 Tool sounds: Pleasant notification sounds for different tool operations
+    - Enable with `GPTME_TOOL_SOUNDS=true`
+    - Different sounds for shell commands, file operations, screenshots, etc.
   - 🎯 Feature flags for advanced usage, see [configuration docs][docs-config]
 
 ### 🛠 Use Cases
@@ -293,37 +297,43 @@ Usage: gptme [OPTIONS] [PROMPTS]...
     /undo         Undo the last action
     /log          Show the conversation log
     /tools        Show available tools
+    /model        List or switch models
     /edit         Edit the conversation in your editor
     /rename       Rename the conversation
-    /fork         Create a copy of the conversation with a new name
+    /fork         Copy the conversation using a new name
     /summarize    Summarize the conversation
-    /replay       Re-execute codeblocks in the conversation, wont store output in log
+    /replay       Rerun tools in the conversation, won't store output
     /impersonate  Impersonate the assistant
     /tokens       Show the number of tokens used
-    /export       Export conversation as standalone HTML
+    /export       Export conversation as HTML
+    /commit       Ask assistant to git commit
+    /setup        Setup gptme with completions and configuration
     /help         Show this help message
     /exit         Exit the program
 
   Keyboard shortcuts:
-    Ctrl+J        Insert a new line without executing the prompt
+    Ctrl+X Ctrl+E  Edit prompt in your editor
+    Ctrl+J         Insert a new line without executing the prompt
 
 Options:
-  -n, --name TEXT        Name of conversation. Defaults to generating a random
+  --name TEXT            Name of conversation. Defaults to generating a random
                          name.
-  -m, --model TEXT       Model to use, e.g. openai/gpt-4o,
-                         anthropic/claude-3-5-sonnet-20240620. If only
-                         provider given, a default is used.
+  -m, --model TEXT       Model to use, e.g. openai/gpt-5, anthropic/claude-
+                         sonnet-4-20250514. If only provider given then a
+                         default is used.
   -w, --workspace TEXT   Path to workspace directory. Pass '@log' to create a
                          workspace in the log directory.
-  -r, --resume           Load last conversation
-  -y, --no-confirm       Skips all confirmation prompts.
-  -n, --non-interactive  Force non-interactive mode. Implies --no-confirm.
-  --system TEXT          System prompt. Can be 'full', 'short', or something
+  --agent-path TEXT      Path to agent workspace directory.
+  -r, --resume           Load most recent conversation.
+  -y, --no-confirm       Skip all confirmation prompts.
+  -n, --non-interactive  Non-interactive mode. Implies --no-confirm.
+  --system TEXT          System prompt. Options: 'full', 'short', or something
                          custom.
-  -t, --tools TEXT       Comma-separated list of tools to allow. Available:
-                         read, save, append, patch, shell, subagent, tmux,
-                         browser, gh, chats, screenshot, vision, computer,
-                         python.
+  -t, --tools TEXT       Tools to allow as comma-separated list. Available:
+                         append, browser, chats, choice, computer, gh,
+                         ipython, morph, patch, rag, read, save, screenshot,
+                         shell, subagent, tmux, tts, vision, youtube.
+  --tool-format TEXT     Tool format to use. Options: markdown, xml, tool
   --no-stream            Don't stream responses
   --show-hidden          Show hidden system messages.
   -v, --verbose          Show verbose output.

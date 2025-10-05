@@ -1,6 +1,9 @@
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal, TypedDict
+
+from typing_extensions import NotRequired
 
 Files = dict[str, str | bytes]
 Status = Literal["success", "error", "timeout"]
@@ -43,6 +46,8 @@ class EvalResult:
     gen_stderr: str
     run_stdout: str
     run_stderr: str
+    log_dir: Path
+    workspace_dir: Path
 
 
 class EvalSpec(TypedDict):
@@ -55,3 +60,4 @@ class EvalSpec(TypedDict):
     run: str
     prompt: str
     expect: dict[str, Callable[[ResultContext], bool]]
+    tools: NotRequired[list[str]]

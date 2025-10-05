@@ -13,7 +13,6 @@ This will show you a list of past chats, allowing you to select one or start a n
 
 To get inspiration for your first prompt, see the :doc:`examples`.
 
-
 .. contents:: Table of Contents
    :depth: 5
    :local:
@@ -42,7 +41,8 @@ Interfaces
 
 Besides the CLI, gptme can be used through:
 
-- :ref:`server:web ui` - A web-based interface
+- :ref:`server:gptme-webui` - A web-based interface
+- A `desktop app <https://github.com/gptme/gptme-tauri>`_ (WIP)
 - :doc:`bot` - GitHub bot integration
 
 For more detailed information about specific features, check out:
@@ -54,6 +54,8 @@ For more detailed information about specific features, check out:
 
 Features
 --------
+
+Here is a very quick overview of the main features of gptme.
 
 .. rubric:: Tools
 
@@ -73,10 +75,10 @@ You can ask the assistant to create new files or modify existing ones:
 
 .. chat::
 
-   User: create a new file named life.py implementing the game of life
+   User: implement game of life in life.py
 
    Assistant: Certainly! I'll create a new file named `life.py` implementing Conway's Game of Life. This implementation will use NumPy for efficient array operations and Matplotlib for visualization. Here's the code:
-   ```life.py
+   ```save life.py
    import numpy as np
    import matplotlib.pyplot as plt
    from matplotlib.animation import FuncAnimation
@@ -92,11 +94,11 @@ You can start chats and request changes directly from the command line. The cont
 
 .. code-block:: bash
 
-   gptme 'make improvements to life.py so that dead cells fade out over time'
+   gptme 'make improvements to life.py so dead cells fade out over time'
 
 .. chat::
 
-   User: make improvements to life.py so that dead cells fade out over time
+   User: make improvements to life.py so dead cells fade out over time
    ```life.py
    ...
    ```

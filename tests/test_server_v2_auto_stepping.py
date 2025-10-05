@@ -55,7 +55,7 @@ def test_auto_stepping(
     )
 
     # Start generation with auto-confirm=2 for automatic stepping
-    with unittest.mock.patch("gptme.server.api_v2._stream", mock_stream):
+    with unittest.mock.patch("gptme.server.api_v2_sessions._stream", mock_stream):
         requests.post(
             f"http://localhost:{port}/api/v2/conversations/{conversation_id}/step",
             json={
@@ -78,6 +78,9 @@ def test_auto_stepping(
         assert wait_for_event(event_listener, "generation_complete")
         assert wait_for_event(event_listener, "tool_pending")
         assert wait_for_event(event_listener, "tool_executing")
+        assert wait_for_event(event_listener, "message_added")
+
+        # Wait for final assistant message
         assert wait_for_event(event_listener, "message_added")
 
     # Verify conversation state

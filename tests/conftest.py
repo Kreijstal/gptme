@@ -10,7 +10,6 @@ import tempfile
 import threading
 import time
 from contextlib import contextmanager
-from datetime import datetime
 
 import pytest
 import requests
@@ -40,6 +39,10 @@ def pytest_configure(config):
         "markers",
         "requires_api: mark test as requiring an API key",
     )
+    # Disable pre-commit checks during tests to avoid interference
+    os.environ["GPTME_CHECK"] = "false"
+    # Disable chat history context during tests for predictable prompts
+    os.environ["GPTME_CHAT_HISTORY"] = "false"
 
 
 def pytest_collection_modifyitems(config, items):
@@ -148,28 +151,27 @@ def client():
 
 
 @pytest.fixture(scope="function")
-def setup_conversation(server_thread):
+def setup_conversation(server_thread, tmp_path):
     """Create a conversation and return its ID, session ID, and port."""
     port = server_thread
     conversation_id = f"test-tools-{int(time.time())}-{random.randint(1000, 9999)}"
 
-    # Create conversation with system message
+    # Create conversation with custom system prompt
     resp = requests.put(
         f"http://localhost:{port}/api/v2/conversations/{conversation_id}",
         json={
-            "messages": [
-                {
-                    "role": "system",
-                    "content": "You are an AI assistant for testing.",
-                    "timestamp": datetime.now().isoformat(),
+            "prompt": "You are an AI assistant for testing.",
+            "config": {
+                "chat": {
+                    "workspace": str(tmp_path),
                 }
-            ]
+            },
         },
     )
     assert resp.status_code == 200
     session_id = resp.json()["session_id"]
 
-    return port, conversation_id, session_id
+    yield port, conversation_id, session_id
 
 
 @pytest.fixture(scope="function")

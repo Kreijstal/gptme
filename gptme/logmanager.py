@@ -1,10 +1,4 @@
-import os
-try:
-    import fcntl
-except ImportError:
-    fcntl = None  # type: ignore
-    if os.name == 'nt':
-        import msvcrt
+import fcntl
 import json
 import logging
 import os
@@ -23,12 +17,12 @@ from typing import (
     TypeAlias,
 )
 
+from dateutil.parser import isoparse
 from rich import print
 
+from .config import ChatConfig, get_project_config
 from .dirs import get_logs_dir
 from .message import Message, len_tokens, print_msg
-from .prompts import get_prompt
-from .tools import get_tools
 from .util.context import enrich_messages_with_context
 from .util.reduce import limit_log, reduce_log
 
@@ -39,7 +33,7 @@ logger = logging.getLogger(__name__)
 RoleLiteral = Literal["user", "assistant", "system"]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, repr=False)
 class Log:
     messages: list[Message] = field(default_factory=list)
 
@@ -51,6 +45,9 @@ class Log:
 
     def __iter__(self) -> Generator[Message, None, None]:
         yield from self.messages
+
+    def __repr__(self) -> str:
+        return f"Log(messages=<{len(self.messages)} msgs>])"
 
     def replace(self, **kwargs) -> "Log":
         return replace(self, **kwargs)
@@ -97,7 +94,7 @@ class LogManager:
             fpath = TemporaryDirectory().name
             logger.warning(f"No logfile specified, using tmpfile at {fpath}")
             self.logdir = Path(fpath)
-        self.name = self.logdir.name
+        self.chat_id = self.logdir.name
 
         # Create and optionally lock the directory
         self.logdir.mkdir(parents=True, exist_ok=True)
@@ -109,10 +106,7 @@ class LogManager:
 
             # Try to acquire an exclusive lock
             try:
-                if fcntl:
-                    fcntl.flock(self._lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                elif os.name == 'nt':
-                    msvcrt.locking(self._lock_fd.fileno(), msvcrt.LK_NBLCK, 1)
+                fcntl.flock(self._lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 # logger.debug(f"Acquired lock on {self.logdir}")
             except BlockingIOError:
                 self._lock_fd.close()
@@ -140,11 +134,7 @@ class LogManager:
         """Release the lock and close the file descriptor"""
         if self._lock_fd:
             try:
-                if os.name == 'nt' and msvcrt:
-                    # On Windows, lock is automatically released on file close
-                    pass
-                elif fcntl:
-                    fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
+                fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
                 self._lock_fd.close()
                 # logger.debug(f"Released lock on {self.logdir}")
             except Exception as e:
@@ -168,8 +158,14 @@ class LogManager:
     @property
     def logfile(self) -> Path:
         if self.current_branch == "main":
-            return get_logs_dir() / self.name / "conversation.jsonl"
+            return get_logs_dir() / self.chat_id / "conversation.jsonl"
         return self.logdir / "branches" / f"{self.current_branch}.jsonl"
+
+    @property
+    def name(self) -> str:
+        """Get the user-friendly display name from ChatConfig, fallback to chat_id."""
+        chat_config = ChatConfig.from_logdir(self.logdir)
+        return chat_config.name or self.chat_id
 
     def append(self, msg: Message) -> None:
         """Appends a message to the log, writes the log, prints the message."""
@@ -277,7 +273,7 @@ class LogManager:
                 raise FileNotFoundError(f"Could not find logfile {logfile}")
 
         log = Log.read_jsonl(logfile)
-        msgs = log.messages or initial_msgs or [get_prompt(get_tools())]
+        msgs = log.messages or initial_msgs or []
         return cls(msgs, logdir=logdir, branch=branch, lock=lock, **kwargs)
 
     def branch(self, name: str) -> None:
@@ -317,39 +313,22 @@ class LogManager:
         else:
             return None
 
-    def rename(self, name: str, keep_date=False) -> None:
-        """
-        Rename the conversation.
-        Renames the folder containing the conversation and its branches.
-
-        If keep_date is True, we will keep the date part of conversation folder name ("2021-08-01-some-name")
-        If you want to keep the old log, use fork()
-        """
-        if keep_date:
-            name = f"{self.logfile.parent.name[:10]}-{name}"
-
-        logsdir = get_logs_dir()
-        new_logdir = logsdir / name
-        if new_logdir.exists():
-            raise FileExistsError(f"Conversation {name} already exists.")
-        self.name = name
-        self.logdir.mkdir(parents=True, exist_ok=True)
-        self.logdir.rename(logsdir / self.name)
-        self.logdir = logsdir / self.name
-
     def fork(self, name: str) -> None:
         """
         Copy the conversation folder to a new name.
         """
         self.write()
         logsdir = get_logs_dir()
-        shutil.copytree(self.logfile.parent, logsdir / name)
+        shutil.copytree(self.logfile.parent, logsdir / name, symlinks=True)
         self.logdir = logsdir / name
+        self.chat_id = name
         self.write()
 
     def to_dict(self, branches=False) -> dict:
         """Returns a dict representation of the log."""
         d: dict[str, Any] = {
+            "id": self.chat_id,
+            "name": self.name,
             "log": [msg.to_dict() for msg in self.log],
             "logfile": str(self.logfile),
         }
@@ -376,7 +355,7 @@ def prepare_messages(
     # Enrich with enabled context enhancements (RAG, fresh context)
     msgs = enrich_messages_with_context(msgs, workspace)
 
-    # Then reduce and limit as before
+    # Use regular reduction
     msgs_reduced = list(reduce_log(msgs))
 
     model = get_default_model()
@@ -407,16 +386,20 @@ def _conversation_files() -> list[Path]:
 class ConversationMeta:
     """Metadata about a conversation."""
 
+    id: str
     name: str
     path: str
     created: float
     modified: float
     messages: int
     branches: int
+    workspace: str
+    agent_name: str | None = None
+    agent_path: str | None = None
 
     def format(self, metadata=False) -> str:
         """Format conversation metadata for display."""
-        output = f"{self.name}"
+        output = f"{self.name} (id: {self.id})"
         if metadata:
             output += f"\nMessages: {self.messages}"
             output += f"\nCreated:  {datetime.fromtimestamp(self.created)}"
@@ -435,21 +418,38 @@ def get_conversations() -> Generator[ConversationMeta, None, None]:
         assert len(log) <= 1
         modified = conv_fn.stat().st_mtime
         first_timestamp = log[0].timestamp.timestamp() if log else modified
+        # Try to get display name from ChatConfig, fallback to folder name
+        conv_id = conv_fn.parent.name
+        chat_config = ChatConfig.from_logdir(conv_fn.parent)
+        display_name = chat_config.name or conv_id
+
+        agent_path = chat_config.agent
+        agent_project_config = get_project_config(agent_path) if agent_path else None
+        agent_name = (
+            agent_project_config.agent.name
+            if agent_project_config and agent_project_config.agent
+            else None
+        )
+
         yield ConversationMeta(
-            name=f"{conv_fn.parent.name}",
+            id=conv_id,
+            name=display_name,
             path=str(conv_fn),
             created=first_timestamp,
             modified=modified,
             messages=len_msgs,
             branches=1 + len(list(conv_fn.parent.glob("branches/*.jsonl"))),
+            workspace=str(chat_config.workspace),
+            agent_name=agent_name,
+            agent_path=str(agent_path) if agent_path else None,
         )
 
 
 def get_user_conversations() -> Generator[ConversationMeta, None, None]:
     """Returns all user conversations, excluding ones used for testing, evals, etc."""
     for conv in get_conversations():
-        if any(conv.name.startswith(prefix) for prefix in ["tmp", "test-"]) or any(
-            substr in conv.name for substr in ["gptme-evals-"]
+        if any(conv.id.startswith(prefix) for prefix in ["tmp", "test-"]) or any(
+            substr in conv.id for substr in ["gptme-evals-"]
         ):
             continue
         yield conv
@@ -478,5 +478,5 @@ def _gen_read_jsonl(path: PathLike) -> Generator[Message, None, None]:
             json_data = json.loads(line)
             files = [Path(f) for f in json_data.pop("files", [])]
             if "timestamp" in json_data:
-                json_data["timestamp"] = datetime.fromisoformat(json_data["timestamp"])
+                json_data["timestamp"] = isoparse(json_data["timestamp"])
             yield Message(**json_data, files=files)

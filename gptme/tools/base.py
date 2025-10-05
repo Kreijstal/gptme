@@ -1,3 +1,4 @@
+import functools
 import importlib
 import json
 import logging
@@ -162,6 +163,7 @@ class ToolSpec:
         parameters: Descriptor of parameters use by this tool.
         load_priority: Influence the loading order of this tool. The higher the later.
         disabled_by_default: Whether this tool should be disabled by default.
+        hooks: Hooks to register when this tool is loaded.
     """
 
     name: str
@@ -173,14 +175,45 @@ class ToolSpec:
     init: InitFunc | None = None
     execute: ExecuteFunc | None = None
     block_types: list[str] = field(default_factory=list)
-    available: bool = True
+    available: bool | Callable[[], bool] = True
     parameters: list[Parameter] = field(default_factory=list)
     load_priority: int = 0
     disabled_by_default: bool = False
     is_mcp: bool = False
+    hooks: dict[str, tuple[str, Callable, int]] = field(default_factory=dict)
+    commands: dict[str, Callable] = field(default_factory=dict)
 
     def __repr__(self):
         return f"ToolSpec({self.name})"
+
+    def register_hooks(self) -> None:
+        """Register all hooks defined in this tool with the global hook registry."""
+        # Avoid circular import
+        from ..hooks import register_hook, HookType
+
+        for hook_name, (hook_type_str, func, priority) in self.hooks.items():
+            try:
+                hook_type = HookType(hook_type_str)
+                full_hook_name = f"{self.name}.{hook_name}"
+                register_hook(full_hook_name, hook_type, func, priority)
+            except (ValueError, KeyError) as e:
+                logger.warning(
+                    f"Failed to register hook '{hook_name}' for tool '{self.name}': {e}"
+                )
+
+    def register_commands(self) -> None:
+        """Register all commands defined in this tool with the global command registry."""
+        # Avoid circular import
+        from ..commands import register_command
+
+        for cmd_name, handler in self.commands.items():
+            try:
+                register_command(cmd_name, handler)
+                logger.debug(f"Registered command '{cmd_name}' from tool '{self.name}'")
+            except Exception as e:
+                logger.warning(
+                    f"Failed to register command '{cmd_name}' for tool '{self.name}': {e}"
+                )
 
     def get_doc(self, doc: str | None = None) -> str:
         """Returns an updated docstring with examples."""
@@ -214,7 +247,16 @@ class ToolSpec:
             return NotImplemented
         return (self.load_priority, self.name) < (other.load_priority, other.name)
 
-    def is_runnable(self):
+    @property
+    def is_available(self) -> bool:
+        """Check if the tool is available for use."""
+        if callable(self.available):
+            return self.available()
+        return self.available
+
+    @property
+    def is_runnable(self) -> bool:
+        """Check if the tool can be executed."""
         return bool(self.execute)
 
     def get_instructions(self, tool_format: ToolFormat):
@@ -282,29 +324,79 @@ class ToolUse:
     def execute(self, confirm: ConfirmFunc) -> Generator[Message, None, None]:
         """Executes a tool-use tag and returns the output."""
         # noreorder
+        from ..hooks import HookType, trigger_hook  # fmt: skip
+        from ..telemetry import record_tool_call, trace_function  # fmt: skip
         from . import get_tool  # fmt: skip
 
-        tool = get_tool(self.tool)
-        if tool and tool.execute:
-            try:
-                ex = tool.execute(
-                    self.content,
-                    self.args,
-                    self.kwargs,
-                    confirm,
-                )
-                if isinstance(ex, Generator):
-                    yield from ex
-                else:
-                    yield ex
-            except Exception as e:
-                # if we are testing, raise the exception
-                logger.exception(e)
-                if "pytest" in globals():
-                    raise e
-                yield Message("system", f"Error executing tool '{self.tool}': {e}")
-        else:
-            logger.warning(f"Tool '{self.tool}' is not available for execution.")
+        # wrap confirm in trace_function
+        @functools.wraps(confirm)
+        def _confirm(content: str) -> bool:
+            return trace_function(
+                name=f"tool.{self.tool}.confirm",
+                attributes={"tool_name": self.tool},
+            )(confirm)(content)
+
+        @trace_function(name=f"tool.{self.tool}", attributes={"tool_name": self.tool})
+        def _execute_tool():
+            tool = get_tool(self.tool)
+            if tool and tool.execute:
+                try:
+                    # Trigger pre-execution hooks
+                    if pre_hook_msgs := trigger_hook(
+                        HookType.TOOL_PRE_EXECUTE,
+                        tool_name=self.tool,
+                        tool_use=self,
+                    ):
+                        yield from pre_hook_msgs
+
+                    # Play tool sound if enabled
+                    from ..util.sound import get_tool_sound_for_tool, play_tool_sound
+
+                    if sound_type := get_tool_sound_for_tool(self.tool):
+                        play_tool_sound(sound_type)
+
+                    ex = tool.execute(
+                        self.content,
+                        self.args,
+                        self.kwargs,
+                        _confirm,
+                    )
+                    if isinstance(ex, Generator):
+                        # Convert generator to list to measure execution time properly
+                        results = list(ex)
+                        yield from results
+                    else:
+                        yield ex
+
+                    # Record successful tool call
+                    record_tool_call(self.tool, success=True)
+
+                    # Trigger post-execution hooks
+                    if post_hook_msgs := trigger_hook(
+                        HookType.TOOL_POST_EXECUTE,
+                        tool_name=self.tool,
+                        tool_use=self,
+                    ):
+                        yield from post_hook_msgs
+
+                except Exception as e:
+                    # Record failed tool call with error details
+                    record_tool_call(
+                        self.tool,
+                        success=False,
+                        error_type=type(e).__name__,
+                        error_message=str(e),
+                    )
+
+                    # if we are testing, raise the exception
+                    logger.exception(e)
+                    if "pytest" in globals():
+                        raise e
+                    yield Message("system", f"Error executing tool '{self.tool}': {e}")
+            else:
+                logger.warning(f"Tool '{self.tool}' is not available for execution.")
+
+        yield from _execute_tool()
 
     @property
     def is_runnable(self) -> bool:
@@ -330,7 +422,7 @@ class ToolUse:
             # NOTE: special case
             args = (
                 codeblock.lang.split(" ")[1:]
-                if tool.name != "save"
+                if tool.name not in ["save", "append", "patch"]
                 else [codeblock.lang]
             )
             return ToolUse(tool.name, args, codeblock.content, start=codeblock.start)
@@ -343,15 +435,29 @@ class ToolUse:
             return None
 
     @classmethod
-    def iter_from_content(cls, content: str) -> Generator["ToolUse", None, None]:
-        """Returns all ToolUse in a message, markdown or XML, in order."""
+    def iter_from_content(
+        cls,
+        content: str,
+        tool_format_override: ToolFormat | None = None,
+        streaming: bool = False,
+    ) -> Generator["ToolUse", None, None]:
+        """Returns all ToolUse in a message, markdown or XML, in order.
+
+        Args:
+            content: The message content to parse
+            tool_format_override: Optional tool format override
+            streaming: If True, requires blank line after code blocks for completion
+        """
+        # Use override if provided, otherwise use global tool_format
+        active_format = tool_format_override or tool_format
+
         # collect all tool uses
         tool_uses = []
-        if tool_format == "xml":
+        if active_format == "xml":
             for tool_use in cls._iter_from_xml(content):
                 tool_uses.append(tool_use)
-        if tool_format == "markdown":
-            for tool_use in cls._iter_from_markdown(content):
+        if active_format == "markdown":
+            for tool_use in cls._iter_from_markdown(content, streaming=streaming):
                 tool_uses.append(tool_use)
 
         # return them in the order they appear
@@ -359,6 +465,10 @@ class ToolUse:
         tool_uses.sort(key=lambda x: x.start or 0)
         for tool_use in tool_uses:
             yield tool_use
+
+        # don't continue unless tool format (or override allows it)
+        if active_format != "tool":
+            return
 
         # check if its a toolcall and extract valid JSON
         if match := toolcall_re.search(content):
@@ -383,15 +493,21 @@ class ToolUse:
                     logger.debug(f"Failed to parse JSON: {json_str}")
 
     @classmethod
-    def _iter_from_markdown(cls, content: str) -> Generator["ToolUse", None, None]:
+    def _iter_from_markdown(
+        cls, content: str, streaming: bool = False
+    ) -> Generator["ToolUse", None, None]:
         """Returns all markdown-style ToolUse in a message.
+
+        Args:
+            content: The message content to parse
+            streaming: If True, requires blank line after code blocks for completion
 
         Example:
           ```ipython
           print("Hello, world!")
           ```
         """
-        for codeblock in Codeblock.iter_from_markdown(content):
+        for codeblock in Codeblock.iter_from_markdown(content, streaming=streaming):
             if tool_use := cls._from_codeblock(codeblock):
                 yield tool_use
 

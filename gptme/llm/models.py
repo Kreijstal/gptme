@@ -88,23 +88,41 @@ MODELS: dict[Provider, dict[str, _ModelDictMeta]] = {
     "openai": OPENAI_MODELS,
     # https://docs.anthropic.com/en/docs/about-claude/models
     "anthropic": {
-        "claude-opus-4-20250514": {
+        "claude-sonnet-4-5": {
             "context": 200_000,
-            "max_output": 64000,
-            "price_input": 15,
-            "price_output": 75,
-            "supports_vision": True,
-            "supports_reasoning": True,
-            # "knowledge_cutoff": datetime(2024, 10, 1),
-        },
-        "claude-sonnet-4-20250514": {
-            "context": 200_000,
-            "max_output": 32000,
+            "max_output": 64_000,
             "price_input": 3,
             "price_output": 15,
             "supports_vision": True,
             "supports_reasoning": True,
-            # "knowledge_cutoff": datetime(2024, 10, 1),
+            "knowledge_cutoff": datetime(2025, 7, 1),
+        },
+        "claude-opus-4-1-20250805": {
+            "context": 200_000,
+            "max_output": 32_000,
+            "price_input": 15,
+            "price_output": 75,
+            "supports_vision": True,
+            "supports_reasoning": True,
+            "knowledge_cutoff": datetime(2025, 3, 1),
+        },
+        "claude-opus-4-20250514": {
+            "context": 200_000,
+            "max_output": 32_000,
+            "price_input": 15,
+            "price_output": 75,
+            "supports_vision": True,
+            "supports_reasoning": True,
+            "knowledge_cutoff": datetime(2025, 3, 1),
+        },
+        "claude-sonnet-4-20250514": {
+            "context": 200_000,
+            "max_output": 64_000,
+            "price_input": 3,
+            "price_output": 15,
+            "supports_vision": True,
+            "supports_reasoning": True,
+            "knowledge_cutoff": datetime(2025, 3, 1),
         },
         "claude-3-7-sonnet-20250219": {
             "context": 200_000,
@@ -192,6 +210,28 @@ MODELS: dict[Provider, dict[str, _ModelDictMeta]] = {
             "price_output": 10,
             "supports_vision": True,
         },
+        "gemini-2.5-flash-lite": {
+            "context": 1_000_000,
+            "max_output": 64_000,
+            "price_input": 0.1,
+            "price_output": 0.4,
+            "supports_vision": True,
+        },
+        "gemini-2.5-flash": {
+            "context": 1_048_576,
+            "max_output": 65_536,
+            "price_input": 0.3,
+            "price_output": 2.5,
+            "supports_vision": True,
+        },
+        "gemini-2.5-pro": {
+            "context": 1_048_576,
+            "max_output": 8192,
+            # NOTE: at >200k context price is 2x for input and 1.5x for output
+            "price_input": 1.25,
+            "price_output": 10,
+            "supports_vision": True,
+        },
     },
     # https://api-docs.deepseek.com/quick_start/pricing
     "deepseek": {
@@ -234,6 +274,21 @@ MODELS: dict[Provider, dict[str, _ModelDictMeta]] = {
         },
     },
     "openrouter": {
+        "qwen/qwen3-max": {
+            "context": 256_000,
+            "max_output": 8192,
+            "price_input": 1.2,
+            "price_output": 6.0,
+            "supports_vision": True,
+        },
+        "mistralai/magistral-medium-2506": {
+            "context": 41_000,
+            "max_output": 40_000,
+            "price_input": 2,
+            "price_output": 5,
+            # "supports_vision": True,
+            "supports_reasoning": True,
+        },
         "anthropic/claude-3.5-sonnet": {
             "context": 200_000,
             "max_output": 8192,
@@ -258,6 +313,20 @@ MODELS: dict[Provider, dict[str, _ModelDictMeta]] = {
             "max_output": 8192,
             "price_input": 0.075,
             "price_output": 0.3,
+            "supports_vision": True,
+        },
+        "moonshotai/kimi-k2": {
+            "context": 262_144,
+            "max_output": 262_144,
+            "price_input": 0.38,
+            "price_output": 1.52,
+            "supports_vision": True,
+        },
+        "moonshotai/kimi-k2-0905": {
+            "context": 262_144,
+            "max_output": 262_144,
+            "price_input": 0.38,
+            "price_output": 1.52,
             "supports_vision": True,
         },
     },
@@ -305,49 +374,238 @@ def get_model(model: str) -> ModelMeta:
         model = get_recommended_model(provider)
         return get_model(f"{provider}/{model}")
 
-    if any(f"{provider}/" in model for provider in PROVIDERS):
-        provider, model = cast(tuple[Provider, str], model.split("/", 1))
-        if provider not in MODELS or model not in MODELS[provider]:
+    # Check if model has provider/model format
+    if any(model.startswith(f"{provider}/") for provider in PROVIDERS):
+        provider_str, model_name = model.split("/", 1)
+
+        # Check if provider is known
+        if provider_str in PROVIDERS:
+            provider = cast(Provider, provider_str)
+
+            # First try static MODELS dict for performance
+            if provider in MODELS and model_name in MODELS[provider]:
+                return ModelMeta(provider, model_name, **MODELS[provider][model_name])
+
+            # For providers that support dynamic fetching, use _get_models_for_provider
+            if provider == "openrouter":
+                try:
+                    models = _get_models_for_provider(provider, dynamic_fetch=True)
+                    for model_meta in models:
+                        if model_meta.model == model_name:
+                            return model_meta
+                except Exception:
+                    # Fall back to unknown model metadata
+                    pass
+
+            # Unknown model, use fallback metadata
             if provider not in ["openrouter", "local"]:
                 log_warn_once(
-                    f"Unknown model: using fallback metadata for {provider}/{model}"
+                    f"Unknown model: using fallback metadata for {provider}/{model_name}"
                 )
-            return ModelMeta(provider, model, context=128_000)
-    else:
-        # try to find model in all providers
-        for provider in MODELS:
-            if model in MODELS[provider]:
-                break
+            return ModelMeta(provider, model_name, context=128_000)
         else:
+            # Unknown provider
             logger.warning(f"Unknown model {model}, using fallback metadata")
             return ModelMeta(provider="unknown", model=model, context=128_000)
+    else:
+        # try to find model in all providers, starting with static models
+        for provider in cast(list[Provider], MODELS.keys()):
+            if model in MODELS[provider]:
+                return ModelMeta(provider, model, **MODELS[provider][model])
 
-    return ModelMeta(provider, model, **MODELS[provider][model])
+        # For model name without provider, also try dynamic fetching for openrouter
+        try:
+            openrouter_models = _get_models_for_provider(
+                "openrouter", dynamic_fetch=True
+            )
+            for model_meta in openrouter_models:
+                if model_meta.model == model:
+                    return model_meta
+        except Exception:
+            pass
+
+        logger.warning(f"Unknown model {model}, using fallback metadata")
+        return ModelMeta(provider="unknown", model=model, context=128_000)
 
 
 def get_recommended_model(provider: Provider) -> str:  # pragma: no cover
     if provider == "openai":
-        return "gpt-4o"
+        return "gpt-5"
     elif provider == "openrouter":
         return "meta-llama/llama-3.1-405b-instruct"
     elif provider == "gemini":
-        return "gemini-1.5-flash-latest"
+        return "gemini-2.5-pro"
     elif provider == "anthropic":
-        return "claude-3-7-sonnet-20250219"
+        return "claude-sonnet-4-5"
     else:
         raise ValueError(f"Provider {provider} did not have a recommended model")
 
 
 def get_summary_model(provider: Provider) -> str:  # pragma: no cover
     if provider == "openai":
-        return "gpt-4o-mini"
+        return "gpt-5-mini"
     elif provider == "openrouter":
         return "meta-llama/llama-3.1-8b-instruct"
     elif provider == "gemini":
-        return "gemini-1.5-flash-latest"
+        return "gemini-2.5-flash"
     elif provider == "anthropic":
-        return "claude-3-haiku-20240307"
+        return "claude-3-5-haiku-20241022"
     elif provider == "deepseek":
         return "deepseek-chat"
     else:
         raise ValueError(f"Provider {provider} did not have a summary model")
+
+
+def _get_models_for_provider(
+    provider: Provider, dynamic_fetch: bool = True
+) -> list[ModelMeta]:
+    """Get models for a specific provider, with optional dynamic fetching."""
+    from . import get_available_models  # fmt: skip
+
+    models_to_show = []
+
+    # Try dynamic fetching first for supported providers
+    if dynamic_fetch and provider == "openrouter":
+        try:
+            dynamic_models = get_available_models(provider)
+            models_to_show = dynamic_models
+        except Exception:
+            # Fall back to static models
+            static_models = [
+                get_model(f"{provider}/{name}") for name in MODELS[provider]
+            ]
+            models_to_show = static_models
+    else:
+        # Use static models
+        if MODELS[provider]:
+            static_models = [
+                get_model(f"{provider}/{name}") for name in MODELS[provider]
+            ]
+            models_to_show = static_models
+
+    return models_to_show
+
+
+def _apply_model_filters(
+    models: list[ModelMeta], vision_only: bool = False, reasoning_only: bool = False
+) -> list[ModelMeta]:
+    """Apply vision and reasoning filters to models."""
+    filtered_models = []
+    for model in models:
+        if vision_only and not model.supports_vision:
+            continue
+        if reasoning_only and not model.supports_reasoning:
+            continue
+        filtered_models.append(model)
+    return filtered_models
+
+
+def _print_simple_format(models: list[ModelMeta]) -> None:
+    """Print models in simple format (one per line)."""
+    for model in models:
+        print(f"{model.provider}/{model.model}")
+
+
+def _format_model_details(model: ModelMeta, show_pricing: bool = False) -> str:
+    """Format model details for display."""
+    info_parts = [f"  {model.model}"]
+
+    # Context window
+    if model.context:
+        context_k = model.context // 1000
+        info_parts.append(f"{context_k}k ctx")
+
+    # Max output
+    if model.max_output:
+        output_k = model.max_output // 1000
+        info_parts.append(f"{output_k}k out")
+
+    # Vision support
+    if model.supports_vision:
+        info_parts.append("vision")
+
+    # Reasoning support
+    if model.supports_reasoning:
+        info_parts.append("reasoning")
+
+    # Pricing
+    if show_pricing and (model.price_input or model.price_output):
+        price_str = f"${model.price_input:.2f}/${model.price_output:.2f}/1M"
+        info_parts.append(price_str)
+
+    return " | ".join(info_parts)
+
+
+def _print_detailed_format(
+    provider: Provider,
+    models: list[ModelMeta],
+    show_pricing: bool = False,
+    dynamic_fetch: bool = True,
+) -> None:
+    """Print models in detailed format with provider grouping."""
+    print(f"\n{provider}:")
+
+    if dynamic_fetch and provider == "openrouter" and len(models) > 0:
+        print(f"  ({len(models)} models available via API)")
+
+    # Show up to 10 models with details
+    for model in models[:10]:
+        print(_format_model_details(model, show_pricing))
+
+    # Show count if more than 10
+    if len(models) > 10:
+        print(f"  ... ({len(models) - 10} more)")
+
+    # Show empty message if no models configured
+    if not models and not MODELS[provider]:
+        print("  (no models configured)")
+
+
+def list_models(
+    provider_filter: str | None = None,
+    show_pricing: bool = False,
+    vision_only: bool = False,
+    reasoning_only: bool = False,
+    simple_format: bool = False,
+    dynamic_fetch: bool = True,
+) -> None:
+    """
+    List available models with optional filtering.
+
+    Args:
+        provider_filter: Only show models from this provider
+        show_pricing: Include pricing information
+        vision_only: Only show models with vision support
+        reasoning_only: Only show models with reasoning support
+        simple_format: Output one model per line as provider/model
+        dynamic_fetch: Fetch dynamic models from APIs where available
+    """
+    if not simple_format:
+        print("Available models:")
+
+    all_models = []
+
+    for provider in MODELS:
+        if provider_filter and provider != provider_filter:
+            continue
+
+        # Get models for this provider
+        models = _get_models_for_provider(provider, dynamic_fetch)
+
+        # Apply filters
+        filtered_models = _apply_model_filters(models, vision_only, reasoning_only)
+
+        if not filtered_models:
+            continue
+
+        # Output models
+        if simple_format:
+            all_models.extend(filtered_models)
+        else:
+            _print_detailed_format(
+                provider, filtered_models, show_pricing, dynamic_fetch
+            )
+
+    # Print all models in simple format at the end
+    if simple_format:
+        _print_simple_format(all_models)

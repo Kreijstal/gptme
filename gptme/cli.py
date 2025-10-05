@@ -2,7 +2,6 @@ import logging
 import os
 import signal
 import sys
-from datetime import datetime
 from itertools import islice
 from pathlib import Path
 from typing import Literal
@@ -13,7 +12,7 @@ from pick import pick
 from . import __version__
 from .chat import chat
 from .commands import _gen_help
-from .config import ChatConfig, get_config, set_config, set_config_from_workspace
+from .config import setup_config_from_cli
 from .constants import MULTIPROMPT_SEPARATOR
 from .dirs import get_logs_dir
 from .init import init_logging
@@ -21,9 +20,10 @@ from .llm.models import get_recommended_model
 from .logmanager import ConversationMeta, get_user_conversations
 from .message import Message
 from .prompts import get_prompt
+from .telemetry import init_telemetry, shutdown_telemetry
 from .tools import ToolFormat, get_available_tools, init_tools
 from .util import epoch_to_age
-from .util.generate_name import generate_name
+from .util.auto_naming import generate_conversation_id
 from .util.interrupt import handle_keyboard_interrupt, set_interruptible
 from .util.prompt import add_history
 
@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 script_path = Path(os.path.realpath(__file__))
 commands_help = "\n".join(_gen_help(incl_langtags=False))
 available_tool_names = ", ".join(
-    sorted([tool.name for tool in get_available_tools() if tool.available])
+    sorted([tool.name for tool in get_available_tools() if tool.is_available])
 )
 
 
@@ -70,20 +70,27 @@ The interface provides user commands that can be used to interact with the syste
 @click.option(
     "-w",
     "--workspace",
+    "workspace",
     default=None,
     help="Path to workspace directory. Pass '@log' to create a workspace in the log directory.",
+)
+@click.option(
+    "--agent-path",
+    "agent_path",
+    default=None,
+    help="Path to agent workspace directory.",
 )
 @click.option(
     "-r",
     "--resume",
     is_flag=True,
-    help="Load last conversation",
+    help="Load most recent conversation.",
 )
 @click.option(
     "-y",
     "--no-confirm",
     is_flag=True,
-    help="Skips all confirmation prompts.",
+    help="Skip all confirmation prompts.",
 )
 @click.option(
     "-n",
@@ -97,21 +104,20 @@ The interface provides user commands that can be used to interact with the syste
     "--system",
     "prompt_system",
     default="full",
-    help="System prompt. Can be 'full', 'short', or something custom.",
+    help="System prompt. Options: 'full', 'short', or something custom.",
 )
 @click.option(
     "-t",
     "--tools",
     "tool_allowlist",
     default=None,
-    multiple=True,
-    help=f"Comma-separated list of tools to allow. Available: {available_tool_names}.",
+    help=f"Tools to allow as comma-separated list. Available: {available_tool_names}.",
 )
 @click.option(
     "--tool-format",
     "tool_format",
     default=None,
-    help="Tool parsing method. Can be 'markdown', 'xml', 'tool'. (experimental)",
+    help="Tool format to use. Options: markdown, xml, tool",
 )
 @click.option(
     "--no-stream",
@@ -141,7 +147,7 @@ def main(
     prompt_system: str,
     name: str,
     model: str | None,
-    tool_allowlist: list[str] | None,
+    tool_allowlist: str | None,
     tool_format: ToolFormat | None,
     stream: bool,
     verbose: bool,
@@ -151,6 +157,7 @@ def main(
     version: bool,
     resume: bool,
     workspace: str | None,
+    agent_path: str | None,
 ):
     """Main entrypoint for the CLI."""
     if version:
@@ -168,6 +175,9 @@ def main(
 
     # init logging
     init_logging(verbose)
+
+    # init telemetry
+    init_telemetry(service_name="gptme-cli")
 
     if not interactive:
         no_confirm = True
@@ -187,16 +197,14 @@ def main(
             # Attempt to switch to interactive mode
             # https://github.com/prompt-toolkit/python-prompt-toolkit/issues/502#issuecomment-466591259
             sys.stdin = sys.stdout
-
-            # Old code, doesn't work with prompt-toolkit
-            # sys.stdin.close()
-            # try:
-            #     sys.stdin = open("/dev/tty")
-            # except OSError:
-            #     # if we can't open /dev/tty, we're probably in a CI environment, so we should just continue
-            #     logger.warning(
-            #         "Failed to switch to interactive mode, continuing in non-interactive mode"
-            #     )
+        else:
+            # If stdin is not a tty and we have prompts provided as arguments,
+            # automatically switch to non-interactive mode to avoid termios errors
+            if prompts:
+                logger.info(
+                    "stdin is not a TTY and prompts provided, switching to non-interactive mode"
+                )
+                interactive = False
 
     # add prompts to prompt-toolkit history
     for prompt in prompts:
@@ -247,53 +255,35 @@ def main(
     else:
         workspace_path = Path(workspace) if workspace else Path.cwd()
 
-    # Parse tool allowlist cli argument.
-    if tool_allowlist:
-        # split comma-separated values
-        tool_allowlist = [tool for tools in tool_allowlist for tool in tools.split(",")]
-
-    # Load main config
-    set_config_from_workspace(workspace_path)
-    config = get_config()
-
-    # Load or create chat config, applying CLI overrides
-    logdir.mkdir(parents=True, exist_ok=True)
-    chat_config = ChatConfig.load_or_create(
+    # Setup complete configuration from CLI arguments and workspace
+    config = setup_config_from_cli(
+        workspace=workspace_path,
         logdir=logdir,
-        cli_config=ChatConfig(
-            model=model,
-            tools=tool_allowlist,
-            tool_format=tool_format,
-            stream=stream,
-            interactive=interactive,
-            workspace=workspace_path,
-        ),
-    ).save()
-
-    # Set chat config in main config
-    config.chat = chat_config
-    set_config(config)
-
-    model = model or config.get_env("MODEL")
-    selected_tool_format: ToolFormat = (
-        tool_format or config.get_env("TOOL_FORMAT") or "markdown"  # type: ignore
+        model=model,
+        tool_allowlist=tool_allowlist,
+        tool_format=tool_format,
+        stream=stream,
+        interactive=interactive,
+        agent_path=Path(agent_path) if agent_path else None,
     )
+    assert config.chat and config.chat.tool_format
 
     # early init tools to generate system prompt
     # We pass the tool_allowlist CLI argument. If it's not provided, init_tools
     # will load it from the environment variable TOOL_ALLOWLIST or the chat config.
-    tools = init_tools(tool_allowlist)
+    logger.debug(f"Using tools: {config.chat.tools}")
+    tools = init_tools(config.chat.tools)
 
     # get initial system prompt
-    initial_msgs = [
-        get_prompt(
-            tools=tools,
-            prompt=prompt_system,
-            interactive=interactive,
-            tool_format=selected_tool_format,
-            model=model,
-        )
-    ]
+    initial_msgs = get_prompt(
+        tools=tools,
+        prompt=prompt_system,
+        interactive=config.chat.interactive,
+        tool_format=config.chat.tool_format,
+        model=config.chat.model,
+        workspace=workspace_path,
+        agent_path=config.chat.agent,
+    )
 
     # register a handler for Ctrl-C
     set_interruptible()  # prepare, user should be able to Ctrl+C until user prompt ready
@@ -304,14 +294,14 @@ def main(
             prompt_msgs,
             initial_msgs,
             logdir,
-            chat_config.model,
-            chat_config.stream,
+            config.chat.workspace,
+            config.chat.model,
+            config.chat.stream,
             no_confirm,
-            chat_config.interactive,
+            config.chat.interactive,
             show_hidden,
-            chat_config.workspace,
-            chat_config.tools,
-            chat_config.tool_format,
+            config.chat.tools,
+            config.chat.tool_format,
         )
     except RuntimeError as e:
         if verbose:
@@ -319,37 +309,8 @@ def main(
         else:
             logger.error(e)
         sys.exit(1)
-
-
-def get_name(name: str) -> str:
-    """
-    Returns a name for the new conversation.
-
-    If name is "random", generates a random name.
-    If name is starts with a date, uses it as is.
-    Otherwise, prepends the current date to the name.
-    """
-    datestr = datetime.now().strftime("%Y-%m-%d")
-    logsdir = get_logs_dir()
-
-    # returns a name for the new conversation
-    if name == "random":
-        # check if name exists, if so, generate another one
-        for _ in range(3):
-            name = generate_name()
-            name = f"{datestr}-{name}"
-            logpath = logsdir / name
-            if not logpath.exists():
-                break
-        else:
-            raise ValueError("Failed to generate unique name")
-    else:
-        # if name starts with date, use as is
-        try:
-            datetime.strptime(name[:10], "%Y-%m-%d")
-        except ValueError:
-            name = f"{datestr}-{name}"
-    return name
+    finally:
+        shutdown_telemetry()
 
 
 def pick_log(limit=20) -> Path:  # pragma: no cover
@@ -394,14 +355,15 @@ def pick_log(limit=20) -> Path:  # pragma: no cover
     elif index == len(options) - 1:
         return pick_log(limit + 100)
     else:
-        return get_logdir(convs[index - 1].name)
+        return get_logdir(convs[index - 1].id)
 
 
 def get_logdir(logdir: Path | str | Literal["random"]) -> Path:
+    logs_dir = get_logs_dir()
     if logdir == "random":
-        logdir = get_logs_dir() / get_name("random")
+        logdir = logs_dir / generate_conversation_id(name="random", logs_dir=logs_dir)
     elif isinstance(logdir, str):
-        logdir = get_logs_dir() / logdir
+        logdir = logs_dir / logdir
 
     logdir.mkdir(parents=True, exist_ok=True)
     return logdir

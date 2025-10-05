@@ -9,14 +9,15 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from gptme.config import get_config
 from gptme.llm.models import get_default_model
 from prompt_toolkit import PromptSession
-from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 from prompt_toolkit.completion import Completer, Completion, PathCompleter
 from prompt_toolkit.document import Document
 from prompt_toolkit.formatted_text import ANSI, HTML, to_formatted_text
 from prompt_toolkit.history import FileHistory
+from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.lexers import PygmentsLexer
 from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.shortcuts import CompleteStyle
@@ -358,7 +359,7 @@ def llm_suggest(text: str) -> list[str]:
     model = get_default_model()
     assert model, "No model loaded"
 
-    enabled = os.environ.get("GPTME_SUGGEST_LLM") in ["1", "true"]
+    enabled = get_config().get_env_bool("GPTME_SUGGEST_LLM")
     if enabled:
         content = _chat_complete(
             messages=[

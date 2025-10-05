@@ -9,8 +9,10 @@ from gptme.config import (
     ChatConfig,
     Config,
     MCPConfig,
+    ProjectConfig,
     get_config,
     load_user_config,
+    setup_config_from_cli,
 )
 
 default_user_config = """[prompt]
@@ -135,6 +137,71 @@ config_json = (
 }
 """
 )
+
+project_config_toml = """
+files = [
+  "README.md",
+  "ARCHITECTURE.md",
+  "gptme.toml"
+]
+context_cmd = "scripts/context.sh"
+prompt = "You are a helpful assistant."
+base_prompt = "My custom base prompt."
+
+[mcp]
+enabled = true
+auto_start = true
+
+[[mcp.servers]]
+name = "sqlite"
+enabled = true
+command = "uvx"
+args = [
+    "mcp-server-sqlite",
+    "--db-path",
+    "database.db"
+]
+
+[[mcp.servers]]
+name = "oura"
+enabled = true
+command = "uvx"
+args = ["oura-mcp-server"]
+
+[rag]
+enabled = true
+
+"""
+
+project_config_json = """
+{
+    "files": ["README.md", "ARCHITECTURE.md", "gptme.toml"],
+    "context_cmd": "scripts/context.sh",
+    "prompt": "You are a helpful assistant.",
+    "base_prompt": "My custom base prompt.",
+    "rag": {
+        "enabled": true
+    },
+    "mcp": {
+        "enabled": true,
+        "auto_start": true,
+        "servers": [
+            {
+                "name": "sqlite",
+                "enabled": true,
+                "command": "uvx",
+                "args": ["mcp-server-sqlite", "--db-path", "database.db"]
+            },
+            {
+                "name": "oura",
+                "enabled": true,
+                "command": "uvx",
+                "args": ["oura-mcp-server"]
+            }
+        ]
+    }
+}
+"""
 
 
 def test_get_config():
@@ -353,7 +420,7 @@ def test_chat_config_loaded_from_toml():
     assert config.tool_format == "markdown"
     assert config.stream is True
     assert config.interactive is True
-    assert config.workspace == Path("~/workspace")
+    assert config.workspace == Path.home() / "workspace"
     assert config.env == {"API_KEY": "your-key"}
     assert config.mcp is not None
     assert config.mcp.enabled is True
@@ -375,7 +442,7 @@ def test_chat_config_loaded_from_json():
     assert config.tool_format == "markdown"
     assert config.stream is True
     assert config.interactive is True
-    assert config.workspace == Path("~/workspace")
+    assert config.workspace == Path.home() / "workspace"
     assert config.env == {"API_KEY": "your-key"}
     assert config.mcp is not None
     assert config.mcp.enabled is True
@@ -409,6 +476,8 @@ def test_chat_config_to_dict():
                 "command": "server-command",
                 "args": ["--arg1", "--arg2"],
                 "env": {"API_KEY": "your-key"},
+                "url": "",
+                "headers": {},
             }
         ],
     }
@@ -427,3 +496,188 @@ def test_default_chat_config_to_toml():
     toml_str = tomlkit.dumps(config.to_dict())
     config_new = ChatConfig.from_dict(tomlkit.loads(toml_str).unwrap())
     assert config_new == config
+
+
+def test_project_config_loaded_from_toml():
+    config = ProjectConfig.from_dict(tomlkit.loads(project_config_toml).unwrap())
+
+    assert config.files == ["README.md", "ARCHITECTURE.md", "gptme.toml"]
+    assert config.context_cmd == "scripts/context.sh"
+    assert config.prompt == "You are a helpful assistant."
+    assert config.base_prompt == "My custom base prompt."
+    assert config.rag.enabled is True
+
+    assert config.mcp is not None
+    assert config.mcp.enabled is True
+    assert config.mcp.auto_start is True
+
+    assert len(config.mcp.servers) == 2
+
+    sqlite_server = next(s for s in config.mcp.servers if s.name == "sqlite")
+    assert sqlite_server.name == "sqlite"
+    assert sqlite_server.enabled is True
+    assert sqlite_server.command == "uvx"
+    assert sqlite_server.args == ["mcp-server-sqlite", "--db-path", "database.db"]
+
+    oura_server = next(s for s in config.mcp.servers if s.name == "oura")
+    assert oura_server.name == "oura"
+    assert oura_server.enabled is True
+    assert oura_server.command == "uvx"
+    assert oura_server.args == ["oura-mcp-server"]
+
+
+def test_project_config_loaded_from_json():
+    config = ProjectConfig.from_dict(json.loads(project_config_json))
+
+    assert config.files == ["README.md", "ARCHITECTURE.md", "gptme.toml"]
+    assert config.context_cmd == "scripts/context.sh"
+    assert config.prompt == "You are a helpful assistant."
+    assert config.base_prompt == "My custom base prompt."
+    assert config.rag.enabled is True
+
+    assert config.mcp is not None
+    assert config.mcp.enabled is True
+    assert config.mcp.auto_start is True
+
+    assert len(config.mcp.servers) == 2
+
+    sqlite_server = next(s for s in config.mcp.servers if s.name == "sqlite")
+    assert sqlite_server.name == "sqlite"
+    assert sqlite_server.enabled is True
+    assert sqlite_server.command == "uvx"
+    assert sqlite_server.args == ["mcp-server-sqlite", "--db-path", "database.db"]
+
+    oura_server = next(s for s in config.mcp.servers if s.name == "oura")
+    assert oura_server.name == "oura"
+    assert oura_server.enabled is True
+    assert oura_server.command == "uvx"
+    assert oura_server.args == ["oura-mcp-server"]
+
+
+def test_project_config_to_dict():
+    config = ProjectConfig.from_dict(json.loads(project_config_json))
+    config_dict = config.to_dict()
+    assert config_dict["files"] == ["README.md", "ARCHITECTURE.md", "gptme.toml"]
+    assert config_dict["context_cmd"] == "scripts/context.sh"
+    assert config_dict["prompt"] == "You are a helpful assistant."
+    assert config_dict["base_prompt"] == "My custom base prompt."
+    assert config_dict["rag"]["enabled"] is True
+    assert config_dict["mcp"]["enabled"] is True
+    assert config_dict["mcp"]["auto_start"] is True
+    assert len(config_dict["mcp"]["servers"]) == 2
+    assert config_dict["mcp"]["servers"][0]["name"] == "sqlite"
+    assert config_dict["mcp"]["servers"][0]["enabled"] is True
+    assert config_dict["mcp"]["servers"][0]["command"] == "uvx"
+    assert config_dict["mcp"]["servers"][0]["args"] == [
+        "mcp-server-sqlite",
+        "--db-path",
+        "database.db",
+    ]
+    assert config_dict["mcp"]["servers"][1]["name"] == "oura"
+    assert config_dict["mcp"]["servers"][1]["enabled"] is True
+    assert config_dict["mcp"]["servers"][1]["command"] == "uvx"
+    assert config_dict["mcp"]["servers"][1]["args"] == ["oura-mcp-server"]
+
+
+def test_project_config_to_toml():
+    config = ProjectConfig.from_dict(json.loads(project_config_json))
+    config_dict = config.to_dict()
+    toml_str = tomlkit.dumps(config_dict)
+    config_new = ProjectConfig.from_dict(tomlkit.loads(toml_str).unwrap())
+    assert config_new == config
+
+
+def test_resume_config_precedence():
+    """Test that resume configuration respects saved config unless CLI overrides provided."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        logdir = Path(tmpdir) / "test-conversation"
+        logdir.mkdir()
+        workspace = Path(tmpdir) / "workspace"
+        workspace.mkdir()
+
+        # Create a saved conversation config with specific model and tool_format
+        saved_config_content = f"""[chat]
+model = "openrouter/test-model"
+tool_format = "xml"
+tools = ["shell", "python"]
+stream = true
+interactive = true
+workspace = "{str(workspace)}"
+
+[env]
+"""
+
+        config_file = logdir / "config.toml"
+        config_file.write_text(saved_config_content)
+
+        # Test 1: Resume without CLI overrides - should use saved config
+        config = setup_config_from_cli(
+            workspace=workspace,
+            logdir=logdir,
+            model=None,  # No CLI override
+            tool_allowlist=None,  # No CLI override
+            tool_format=None,  # No CLI override
+            stream=True,
+            interactive=True,
+            agent_path=None,
+        )
+
+        assert config.chat is not None, "Chat config should be loaded"
+        assert (
+            config.chat.model == "openrouter/test-model"
+        ), "Should use saved model when no CLI override"
+        assert (
+            config.chat.tool_format == "xml"
+        ), "Should use saved tool_format when no CLI override"
+        assert config.chat.tools is not None and (
+            "shell" in config.chat.tools
+        ), "Should use saved tools when no CLI override"
+
+        # Test 2: Resume with CLI overrides - should use CLI values
+        config = setup_config_from_cli(
+            workspace=workspace,
+            logdir=logdir,
+            model="anthropic/claude-3-sonnet",  # CLI override
+            tool_allowlist="browser,read",  # CLI override
+            tool_format="markdown",  # CLI override
+            stream=True,
+            interactive=True,
+            agent_path=None,
+        )
+
+        assert config.chat is not None, "Chat config should be loaded"
+        assert (
+            config.chat.model == "anthropic/claude-3-sonnet"
+        ), "Should use CLI model when provided"
+        assert (
+            config.chat.tool_format == "markdown"
+        ), "Should use CLI tool_format when provided"
+        assert config.chat.tools == [
+            "browser",
+            "read",
+        ], "Should use CLI tools when provided"
+
+        # Test 3: New conversation (no saved config) - should fall back to env/defaults
+        new_logdir = Path(tmpdir) / "new-conversation"
+        new_logdir.mkdir()
+
+        config = setup_config_from_cli(
+            workspace=workspace,
+            logdir=new_logdir,
+            model=None,  # No CLI override
+            tool_allowlist=None,  # No CLI override
+            tool_format=None,  # No CLI override
+            stream=True,
+            interactive=True,
+            agent_path=None,
+        )
+
+        # For new conversations, should use defaults/env (tool_format defaults to "markdown")
+        assert config.chat is not None, "Chat config should be loaded"
+        assert (
+            config.chat.tool_format == "markdown"
+        ), "Should use default tool_format for new conversation"
+        # Model will depend on env vars, so we just check it's not the saved value
+        assert (
+            config.chat.model != "openrouter/test-model"
+        ), "Should not use saved model for new conversation"

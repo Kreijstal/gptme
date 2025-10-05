@@ -37,10 +37,11 @@ Lynx backend:
     This is an experimental feature. It needs some work to be more robust and useful.
 """
 
-import importlib.util
 import importlib.metadata
+import importlib.util
 import logging
 import shutil
+from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
@@ -53,12 +54,20 @@ browser: Literal["playwright", "lynx"] | None = (
     "playwright" if has_playwright() else ("lynx" if has_lynx() else None)
 )
 
+# Check for Perplexity availability
+try:
+    from ._browser_perplexity import has_perplexity_key, search_perplexity  # fmt: skip
+
+    has_perplexity = has_perplexity_key()
+except ImportError:
+    has_perplexity = False
+    search_perplexity = None  # type: ignore
+
 # noreorder
 if browser == "playwright":
+    from ._browser_playwright import read_logs as read_logs_playwright  # fmt: skip
     from ._browser_playwright import read_url as read_url_playwright  # fmt: skip
-    from ._browser_playwright import (
-        screenshot_url as screenshot_url_playwright,  # fmt: skip
-    )
+    from ._browser_playwright import screenshot_url as screenshot_url_pw  # fmt: skip
     from ._browser_playwright import search_duckduckgo, search_google  # fmt: skip
 elif browser == "lynx":
     from ._browser_lynx import read_url as read_url_lynx  # fmt: skip
@@ -66,7 +75,8 @@ elif browser == "lynx":
 
 logger = logging.getLogger(__name__)
 
-EngineType = Literal["google", "duckduckgo"]
+# Always include all engine types in the type definition
+EngineType = Literal["google", "duckduckgo", "perplexity"]
 
 
 def examples(tool_format):
@@ -100,20 +110,44 @@ System:
 {ToolUse("https://activitywatch.net/", [], "... The ActivityWatch project was founded by Erik Bjäreholt in 2016. ...".strip()).to_output()}
 Assistant: The founder of ActivityWatch is Erik Bjäreholt.
 
+### Searching with Perplexity
+User: what are the latest developments in AI?
+Assistant: Let me search for that using Perplexity AI.
+{ToolUse("ipython", [], "search('latest developments in AI', 'perplexity')").to_output(tool_format)}
+System:
+{ToolUse("result", [], "Based on recent developments, AI has seen significant advances...").to_output()}
+Assistant: Based on the search results, here are the latest AI developments...
+
 ### Take screenshot of page
 User: take a screenshot of the ActivityWatch website
 Assistant: Certainly! I'll use the browser tool to screenshot the ActivityWatch website.
 {ToolUse("ipython", [], "screenshot_url('https://activitywatch.net')").to_output(tool_format)}
 System:
 {ToolUse("result", [], "Screenshot saved to screenshot.png").to_output()}
+
+### Read URL and check browser logs
+User: read this page and check if there are any console errors
+Assistant: I'll read the page first and then check the browser logs.
+{ToolUse("ipython", [], "read_url('https://example.com')").to_output(tool_format)}
+System:
+{ToolUse("https://example.com", [], "This domain is for use in illustrative examples...").to_output()}
+Assistant: Now let me check the browser console logs:
+{ToolUse("ipython", [], "read_logs()").to_output(tool_format)}
+System:
+{ToolUse("result", [], "No logs or errors captured.").to_output()}
 """.strip()
 
 
-def has_browser_tool():
+def init() -> ToolSpec:
     if browser == "playwright":
-        console.log("Browser tool available (using playwright)")
+        console.log("Using browser tool with playwright")
     elif browser == "lynx":
-        console.log("Browser tool available (using lynx)")
+        console.log("Using browser tool with lynx")
+    return tool
+
+
+@lru_cache
+def has_browser_tool():
     return browser is not None
 
 
@@ -129,7 +163,12 @@ def read_url(url: str) -> str:
 def search(query: str, engine: EngineType = "google") -> str:
     """Search for a query on a search engine."""
     logger.info(f"Searching for '{query}' on {engine}")
-    if browser == "playwright":
+    if engine == "perplexity":
+        if has_perplexity:
+            return search_perplexity(query)  # type: ignore
+        else:
+            return "Error: Perplexity search not available. Set PERPLEXITY_API_KEY environment variable or add it to ~/.config/gptme/config.toml"
+    elif browser == "playwright":
         return search_playwright(query, engine)
     elif browser == "lynx":
         return search_lynx(query, engine)  # type: ignore
@@ -149,15 +188,24 @@ def screenshot_url(url: str, path: Path | str | None = None) -> Path:
     """Take a screenshot of a webpage."""
     assert browser
     if browser == "playwright":
-        return screenshot_url_playwright(url, path)  # type: ignore
+        return screenshot_url_pw(url, path)  # type: ignore
     raise ValueError("Screenshot not supported with lynx backend")
+
+
+def read_logs() -> str:
+    """Read browser console logs from the last read URL."""
+    assert browser
+    if browser == "playwright":
+        return read_logs_playwright()  # type: ignore
+    raise ValueError("Browser logs not supported with lynx backend")
 
 
 tool = ToolSpec(
     name="browser",
     desc="Browse, search or screenshot the web",
     examples=examples,
-    functions=[read_url, search, screenshot_url],
-    available=has_browser_tool(),
+    functions=[read_url, search, screenshot_url, read_logs],
+    available=has_browser_tool,
+    init=init,
 )
 __doc__ = tool.get_doc(__doc__)

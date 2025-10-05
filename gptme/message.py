@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Literal
 
 import tomlkit
+from dateutil.parser import isoparse
 from rich.syntax import Syntax
 from tomlkit._utils import escape_string
 from typing_extensions import Self
@@ -170,7 +171,7 @@ call_id = "{self.call_id}"
             pinned=msg.get("pinned", False),
             hide=msg.get("hide", False),
             files=[Path(f) for f in msg.get("files", [])],
-            timestamp=datetime.fromisoformat(msg["timestamp"]),
+            timestamp=isoparse(msg["timestamp"]),
             call_id=msg.get("call_id", None),
         )
 
@@ -247,8 +248,9 @@ def format_msgs(
         status_emoji = ""
         if msg.role == "system":
             first_line = msg.content.split("\n", 1)[0].lower()
-            isSuccess = first_line.startswith(
-                ("saved", "appended", "patch successfully")
+            first_three_words = first_line.split()[:3]
+            isSuccess = first_line.startswith(("saved", "appended")) or any(
+                word in ["success", "successfully"] for word in first_three_words
             )
             isError = first_line.startswith(("error", "failed"))
             if isSuccess:
@@ -315,7 +317,7 @@ def toml_to_msgs(toml: str) -> list[Message]:
             msg["content"].strip(),
             pinned=msg.get("pinned", False),
             hide=msg.get("hide", False),
-            timestamp=datetime.fromisoformat(msg["timestamp"]),
+            timestamp=isoparse(msg["timestamp"]),
         )
         for msg in msgs
     ]

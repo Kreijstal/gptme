@@ -9,7 +9,7 @@ from dataclasses import (
 )
 from functools import lru_cache
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import tomlkit
 from tomlkit import TOMLDocument
@@ -20,7 +20,7 @@ from typing_extensions import Self
 from .util import console, path_with_tilde
 
 if TYPE_CHECKING:
-    from .tools import ToolFormat
+    from .tools.base import ToolFormat
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +34,13 @@ class MCPServerConfig:
     command: str = ""
     args: list[str] = field(default_factory=list)
     env: dict = field(default_factory=dict)
+    url: str = ""
+    headers: dict = field(default_factory=dict)
+
+    @property
+    def is_http(self) -> bool:
+        """Check if this is an HTTP MCP server."""
+        return bool(self.url and self.url.startswith(("http://", "https://")))
 
 
 @dataclass
@@ -66,6 +73,11 @@ class UserPromptConfig:
     about_user: str | None = None
     response_preference: str | None = None
     project: dict[str, str] = field(default_factory=dict)
+    # Additional files to include in context. Supports:
+    # - Absolute paths
+    # - ~ expansion
+    # - Relative paths (resolved against the config directory, e.g. ~/.config/gptme)
+    files: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -93,6 +105,13 @@ class RagConfig:
 
 
 @dataclass
+class AgentConfig:
+    """Configuration for agent-specific settings."""
+
+    name: str
+
+
+@dataclass
 class ProjectConfig:
     """Project-level configuration, such as which files to include in the context by default.
 
@@ -103,12 +122,76 @@ class ProjectConfig:
 
     base_prompt: str | None = None
     prompt: str | None = None
-    files: list[str] = field(default_factory=list)
+    files: list[str] | None = None
     context_cmd: str | None = None
     rag: RagConfig = field(default_factory=RagConfig)
+    agent: AgentConfig | None = None
 
     env: dict[str, str] = field(default_factory=dict)
     mcp: MCPConfig | None = None
+
+    @classmethod
+    def from_dict(cls, config_data: dict, workspace: Path | None = None) -> Self:
+        """Create a ProjectConfig instance from a dictionary. Warns about unknown keys."""
+        prompt = config_data.pop("prompt", None)
+        files = config_data.pop("files", None)
+        context_cmd = config_data.pop("context_cmd", None)
+        rag = RagConfig(**config_data.pop("rag", {}))
+        agent = (
+            AgentConfig(**config_data.pop("agent")) if "agent" in config_data else None
+        )
+        env = config_data.pop("env", {})
+        if mcp := config_data.pop("mcp", None):
+            mcp = MCPConfig.from_dict(mcp)
+
+        # Check for unknown keys
+        if config_data:
+            logger.warning(f"Unknown keys in project config: {config_data.keys()}")
+
+        return cls(
+            _workspace=workspace,
+            prompt=prompt,
+            files=files,
+            context_cmd=context_cmd,
+            rag=rag,
+            agent=agent,
+            env=env,
+            mcp=mcp,
+            **config_data,
+        )
+
+    def merge(self, other: Self) -> Self:
+        """Merge another ProjectConfig into this one."""
+        return replace(self, **{k: v for k, v in other.to_dict().items()})
+
+    def to_dict(self) -> dict:
+        """Convert ProjectConfig to a dictionary. Returns a dict with non-'mcp' and non-'env' keys nested under a 'project' key, and 'env' and 'mcp' as top-level keys."""
+
+        # Custom function to handle Path objects during serialization
+        def _dict_factory(items):
+            result = {}
+            for key, value in items:
+                if isinstance(value, Path):
+                    result[key] = str(path_with_tilde(value))
+                else:
+                    result[key] = value
+            return result
+
+        # Convert to dict and remove None values (including in nested dicts), using custom dict factory to handle Path objects
+        def remove_none_values(d):
+            if not isinstance(d, dict):
+                return d
+            return {k: remove_none_values(v) for k, v in d.items() if v is not None}
+
+        config_dict = remove_none_values(
+            {
+                k: v
+                for k, v in asdict(self, dict_factory=_dict_factory).items()
+                if not k.startswith("_")
+            }
+        )
+
+        return config_dict
 
 
 ABOUT_ACTIVITYWATCH = """ActivityWatch is a free and open-source automated time-tracker that helps you track how you spend your time on your devices."""
@@ -188,7 +271,7 @@ def set_config_value(key: str, value: str) -> None:  # pragma: no cover
     reload_config()
 
 
-@lru_cache(maxsize=1)
+@lru_cache(maxsize=4)
 def get_project_config(workspace: Path | None) -> ProjectConfig | None:
     """
     Get a cached copy of or load the project configuration from a gptme.toml file in the workspace or .github directory.
@@ -214,26 +297,7 @@ def get_project_config(workspace: Path | None) -> ProjectConfig | None:
         with open(project_config_path) as f:
             config_data = tomlkit.load(f).unwrap()
 
-        prompt = config_data.pop("prompt", "")
-        files = config_data.pop("files", [])
-        context_cmd = config_data.pop("context_cmd", None)
-        rag = RagConfig(**config_data.pop("rag", {}))
-        if mcp := config_data.pop("mcp", None):
-            mcp = MCPConfig.from_dict(mcp)
-
-        # Check for unknown keys
-        if config_data:
-            logger.warning(f"Unknown keys in project config: {config_data.keys()}")
-
-        return ProjectConfig(
-            _workspace=workspace,
-            prompt=prompt,
-            files=files,
-            context_cmd=context_cmd,
-            rag=rag,
-            mcp=mcp,
-            **config_data,
-        )
+        return ProjectConfig.from_dict(config_data, workspace=workspace)
     return None
 
 
@@ -244,6 +308,7 @@ class ChatConfig:
     _logdir: Path | None = None
 
     # these are under a [chat] namespace in the toml
+    name: str | None = None
     model: str | None = None
     tools: list[str] | None = None
     tool_format: "ToolFormat | None" = None
@@ -252,9 +317,20 @@ class ChatConfig:
     workspace: Path = field(
         default_factory=Path.cwd
     )  # TODO: Is default value cwd ok for server?
+    agent: Path | None = None
 
     env: dict = field(default_factory=dict)
     mcp: MCPConfig | None = None
+
+    @property
+    def agent_config(self) -> AgentConfig | None:
+        """Get the agent configuration if available."""
+        if not self.agent:
+            return None
+        agent_project_config = get_project_config(self.agent)
+        if agent_project_config and agent_project_config.agent:
+            return agent_project_config.agent
+        return None
 
     @classmethod
     def from_dict(cls, config_data: dict) -> Self:
@@ -264,12 +340,16 @@ class ChatConfig:
         # Extract chat settings
         chat_data = config_data.pop("chat", {})
 
-        # Convert workspace to Path if present
+        # Convert workspace to Path if present and resolve to absolute path
         if "workspace" in chat_data:
-            chat_data["workspace"] = Path(chat_data["workspace"])
+            chat_data["workspace"] = Path(chat_data["workspace"]).expanduser().resolve()
         # For old-style config, check if workspace is in the logdir
         elif _logdir and (_logdir / "workspace").exists():
             chat_data["workspace"] = (_logdir / "workspace").resolve()
+
+        # Extract agent
+        agent_path = chat_data.pop("agent", None)
+        agent = Path(agent_path).expanduser().resolve() if agent_path else None
 
         env = config_data.pop("env", {})
         mcp = (
@@ -285,6 +365,7 @@ class ChatConfig:
         return cls(
             _logdir=_logdir,
             **chat_data,
+            agent=agent,
             env=env,
             mcp=mcp,
         )
@@ -297,8 +378,8 @@ class ChatConfig:
             if (path / "workspace").exists():
                 workspace = (path / "workspace").resolve()
                 return cls(_logdir=path, workspace=workspace)
-            logger.warning(
-                f"Neither chat config nor workspace found at {path}, using default config."
+            logger.debug(
+                f"No existing config found at {path}, using default config for new conversation."
             )
             return cls(_logdir=path)
         try:
@@ -325,8 +406,22 @@ class ChatConfig:
 
         # Set the workspace symlink in the logdir
         workspace_path = self._logdir / "workspace"
-        workspace_path.unlink(missing_ok=True)
-        workspace_path.symlink_to(self.workspace)
+
+        # Only create symlink if workspace is different from the log workspace
+        if self.workspace != workspace_path:
+            if workspace_path.exists():
+                if workspace_path.is_dir() and not workspace_path.is_symlink():
+                    # It's a directory with potential user content, don't delete it
+                    raise ValueError(
+                        f"Workspace directory '{workspace_path}' already exists and contains data. "
+                        "Cannot change workspace when directory is in use. "
+                        "Please move or rename the existing directory first."
+                    )
+                else:
+                    # It's a file or symlink, safe to remove
+                    workspace_path.unlink()
+            workspace_path.symlink_to(self.workspace)
+        # If workspace IS the log workspace, no symlink needed - directory already exists
 
         return self
 
@@ -338,7 +433,7 @@ class ChatConfig:
             result = {}
             for key, value in items:
                 if isinstance(value, Path):
-                    result[key] = str(value)
+                    result[key] = str(path_with_tilde(value))
                 else:
                     result[key] = value
             return result
@@ -377,16 +472,34 @@ class ChatConfig:
         config = cls.from_logdir(logdir)
         defaults = cls()
 
-        # Apply CLI overrides (only if they differ from defaults)
+        # Apply CLI overrides for explicitly provided values
         for field_name in cli_config.__dataclass_fields__:
             if field_name.startswith("_"):
                 continue
             cli_value = getattr(cli_config, field_name)
             default_value = getattr(defaults, field_name)
-            # TODO: note that this isn't a great check: CLI values equal to defaults won't override existing config values
-            if cli_value != default_value:
-                # logger.info(f"Overriding {field_name} with CLI value: {cli_value}")
+
+            # For optional fields that default to None, check if explicitly provided
+            if (
+                field_name in ["model", "tool_format", "tools", "agent"]
+                and cli_value is not None
+            ):
+                logger.debug(f"Overriding {field_name} with CLI value: {cli_value}")
                 config = replace(config, **{field_name: cli_value})
+            # For other fields, use the original logic (differs from defaults)
+            elif (
+                field_name not in ["model", "tool_format", "tools", "agent"]
+                and cli_value != default_value
+            ):
+                logger.debug(f"Overriding {field_name} with CLI value: {cli_value}")
+                config = replace(config, **{field_name: cli_value})
+
+        # Auto-detect agent if not explicitly set
+        if config.agent is None:
+            project_config = get_project_config(config.workspace)
+            if project_config and project_config.agent:
+                config = replace(config, agent=config.workspace)
+                logger.debug(f"Auto-detected agent workspace: {config.workspace}")
 
         return config
 
@@ -479,6 +592,11 @@ class Config:
             or default
         )
 
+    def get_env_bool(self, key: str, default: bool | None = None) -> bool | None:
+        if env_value := self.get_env(key):
+            return env_value.lower() in ("1", "true", "yes", "on")
+        return default
+
     def get_env_required(self, key: str) -> str:
         """Gets an environment variable, checks the config file if it's not set in the environment."""
         if (
@@ -535,6 +653,103 @@ def reload_config() -> Config:
         _thread_local.config = Config()
     assert _thread_local.config
     return _thread_local.config
+
+
+def setup_config_from_cli(
+    workspace: Path,
+    logdir: Path,
+    model: str | None = None,
+    tool_allowlist: str | None = None,
+    tool_format: "ToolFormat | None" = None,
+    stream: bool = True,
+    interactive: bool = True,
+    agent_path: Path | None = None,
+) -> Config:
+    """
+    Initialize and return a complete config from CLI arguments and workspace.
+
+    Handles the precedence: CLI args -> saved conversation config -> env vars -> config files -> defaults
+    """
+    from .tools import get_toolchain
+
+    # Load base config from workspace
+    set_config_from_workspace(workspace)
+    config = get_config()
+
+    # Check if we're resuming an existing conversation
+    existing_chat_config = None
+    if logdir.exists() and (logdir / "config.toml").exists():
+        existing_chat_config = ChatConfig.from_logdir(logdir)
+
+    # Resolve configuration values with proper precedence
+    # For resuming: CLI args -> saved conversation config -> env vars/config files
+    # For new conversations: CLI args -> env vars/config files -> defaults
+    resolved_model: str | None
+    if model is not None:
+        # CLI override always takes precedence
+        resolved_model = model
+    elif existing_chat_config and existing_chat_config.model:
+        # When resuming, use saved conversation model unless CLI override provided
+        resolved_model = existing_chat_config.model
+    else:
+        # Fall back to env/config for new conversations or when no saved model
+        resolved_model = config.get_env("MODEL")
+
+    # Handle tool allowlist with similar precedence
+    resolved_tool_allowlist: list[str] | None = None
+    if tool_allowlist is not None:
+        # CLI override always takes precedence
+        resolved_tool_allowlist = [tool.strip() for tool in tool_allowlist.split(",")]
+    elif existing_chat_config and existing_chat_config.tools:
+        # When resuming, use saved conversation tools unless CLI override provided
+        resolved_tool_allowlist = existing_chat_config.tools
+    elif tools_env := config.get_env("TOOLS"):
+        # Fall back to env/config for new conversations or when no saved tools
+        resolved_tool_allowlist = [tool.strip() for tool in tools_env.split(",")]
+
+    # Handle tool_format with similar precedence
+    if tool_format is not None:
+        # CLI override always takes precedence
+        resolved_tool_format = tool_format
+    elif existing_chat_config and existing_chat_config.tool_format:
+        # When resuming, use saved conversation tool_format unless CLI override provided
+        resolved_tool_format = existing_chat_config.tool_format
+    else:
+        # Fall back to env/config for new conversations or when no saved tool_format
+        resolved_tool_format = (
+            cast("ToolFormat", config.get_env("TOOL_FORMAT")) or "markdown"
+        )
+
+    # Handle agent_path with similar precedence
+    resolved_agent_path: Path | None = agent_path
+    if agent_path is None and existing_chat_config and existing_chat_config.agent:
+        # When resuming, use saved conversation agent unless CLI override provided
+        resolved_agent_path = existing_chat_config.agent
+
+    # Create or load chat config with CLI overrides
+    logdir.mkdir(parents=True, exist_ok=True)
+    config.chat = ChatConfig.load_or_create(
+        logdir=logdir,
+        cli_config=ChatConfig(
+            model=resolved_model,
+            tool_format=resolved_tool_format,
+            stream=stream,
+            interactive=interactive,
+            workspace=workspace,
+            agent=resolved_agent_path,
+        ),
+    )
+
+    # Set tools if not already set or if CLI override provided
+    if config.chat.tools is None or tool_allowlist is not None:
+        config.chat.tools = [
+            tool.name for tool in get_toolchain(resolved_tool_allowlist)
+        ]
+
+    # Save and set the final config
+    config.chat.save()
+    set_config(config)
+    return config
 
 
 if __name__ == "__main__":
