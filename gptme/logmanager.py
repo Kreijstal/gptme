@@ -119,7 +119,7 @@ class LogManager:
             try:
                 if fcntl:
                     fcntl.flock(self._lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                elif os.name == 'nt':
+                elif os.name == 'nt' and msvcrt:
                     msvcrt.locking(self._lock_fd.fileno(), msvcrt.LK_NBLCK, 1)  # type: ignore
                 # logger.debug(f"Acquired lock on {self.logdir}")
             except BlockingIOError:

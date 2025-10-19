@@ -439,6 +439,8 @@ class ShellSession:
 
         else:
             # Unix implementation using select
+            if not select:
+                raise RuntimeError("select module is not available on this platform")
             try:
                 while True:
                     # Calculate remaining timeout
